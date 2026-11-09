@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported version and the current one. setup-python has no
+        # 3.9 build for images newer than 24.04, so that job pins its image.
+        include:
+          - python-version: "3.9"
+            os: ubuntu-24.04
+          - python-version: "3.13"
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile
+        run: python3 -m py_compile skills/skillbouncer/scripts/*.py
+      - name: Regression tests
+        run: python3 -I tests/run_tests.py
+      - name: Prefilter equivalence
+        run: |
+          python3 -I tests/make_fixtures.py tests/fixtures-out
+          python3 -I tests/verify_prefilter.py skills/skillbouncer/scripts/skillbouncer_scan.py tests/fixtures-out

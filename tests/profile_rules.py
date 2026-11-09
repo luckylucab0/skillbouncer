@@ -1,5 +1,6 @@
-"""Misst, wie lange jede Regel des Scanners ueber alle Textdateien braucht.
-Aufruf: python3 -I profile_rules.py <scanner.py> <ordner> [<ordner> ...]"""
+"""Measures how long each scanner rule takes over all text files.
+
+Usage: python3 -I profile_rules.py <scanner.py> <folder> [<folder> ...]"""
 import importlib.util
 import sys
 import time
@@ -21,7 +22,7 @@ for base in sys.argv[2:]:
         if b"\x00" in data[:8192]:
             continue
         texts.append((f, data.decode("utf-8", "replace")))
-print("Dateien:", len(texts))
+print("files:", len(texts))
 
 timings = []
 for rid, sev, desc, rx, code_only in scan.RULES:
@@ -41,4 +42,4 @@ for f, text in texts:
 timings.append((time.perf_counter() - t, "BLOBS"))
 for dt, name in sorted(timings, reverse=True)[:15]:
     print("%8.2fs  %s" % (dt, name))
-print("Summe: %.1fs" % sum(d for d, _ in timings))
+print("total: %.1fs" % sum(d for d, _ in timings))
