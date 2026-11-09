@@ -8,6 +8,9 @@ month for changes that arrived through updates. It consists of one skill (the
 review procedure Claude follows) and two Python scripts that need nothing but
 the standard library: a static pattern scanner and a hash baseline tool.
 
+The skill texts, the messages of the scripts and the rest of the
+documentation are English. Claude still answers in the user's language.
+
 ## What it does and does not do
 
 It does:
@@ -73,9 +76,6 @@ PENDING and waits for the user's decision. When the scanner version differs
 from the one recorded in the baseline, every unit is scanned again, because
 units cleared under older rules have never been seen by the new ones. The
 procedure is in `skills/skillbouncer/references/monthly-run.md`.
-
-Claude answers in the user's language in both modes. The skill text itself
-is English.
 
 ## Severity levels and exit codes
 
@@ -143,7 +143,11 @@ Options:
 Read the "Files scanned" count in the report header. A path that does not
 exist, a broken archive or an empty folder ends in a HIGH finding
 (`SCAN-TARGET`, `ARCHIVE-ERROR`, `SCAN-EMPTY`) and exit code 2, never in a
-clean report. Usage errors exit with 2 as well. Snippets in the report
+clean report. The same holds for content the scanner could not read in
+full: a file over 5 MB (`FS-TRUNCATED`), a binary under a text or code
+extension (`FS-UNKNOWN-BIN`), an archive entry that cannot be extracted, a
+folder that cannot be listed (`IO-ERROR`). Usage errors and internal errors
+exit with 2 as well. Snippets in the report
 are quotes from the scanned, untrusted content. When skillbouncer scans
 itself it reports its own search patterns and documentation as HIGH; that is
 expected.
@@ -269,6 +273,8 @@ python3 -I tests/verify_prefilter.py skills/skillbouncer/scripts/skillbouncer_sc
 `tests/run_tests.py` builds both fixture sets into a temporary folder, runs
 the scanner and the baseline script on them and checks the results against
 the expected rule IDs per fixture.
+The run takes about half a minute; most of that are inputs that used to
+stall the scanner.
 `tests/verify_prefilter.py` proves that the scanner's fast whole-file
 prefilter loses no per-line hit; its last line must end in `lost 0`.
 `tests/profile_rules.py <scanner.py> <folder>` shows which rules cost the
@@ -288,8 +294,8 @@ generated and ignored by git.
 2. Add an inert fixture that triggers it to `tests/make_fixtures.py`, or to
    `tests/make_evasion_fixtures.py` when it models an evasion technique.
 3. Add the rule ID to the expected IDs of that fixture in
-   `tests/run_tests.py`, and check that the benign fixture (`benign-api`)
-   still has no MEDIUM or HIGH finding.
+   `tests/run_tests.py`, and check that the benign fixtures (`benign-api`,
+   `ev-benign`, `ev-benign-meta`) still have no MEDIUM or HIGH finding.
 4. Run the tests and `verify_prefilter.py`.
 
 Leave existing regexes as they are unless you mean to change a rule; they

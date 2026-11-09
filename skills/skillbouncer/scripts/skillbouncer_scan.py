@@ -526,8 +526,9 @@ RULES = [
     ("MAL-ANTIFORENSIC", "HIGH", "Covers tracks (shell history, event logs, self-deletion, timestamps)",
      re.compile(r"(history\s+-c\b|unset\s+HISTFILE|HISTFILE=/dev/null|HISTSIZE=0|>\s*~?/?\.?(bash|zsh)_history|rm\s[^\n]{0,200}\.(bash|zsh)_history|wevtutil(\.exe)?\s+(cl|clear-log)|Clear-EventLog|Remove-EventLog|auditpol\s+/clear|journalctl\s+--(vacuum|rotate)|shred\s+-[a-z]*u|os\.(remove|unlink)\(\s*(__file__|sys\.argv\[0\])|unlink(Sync)?\(\s*__filename\s*\)|rm\s+(-f\s+)?[\"']?\$0[\"']?(\s|$)|Remove-Item[^\n]{0,200}\$MyInvocation|touch\s+-[a-z]*r\s|Set-ItemProperty[^\n]{0,200}(LastWriteTime|CreationTime))", I), False),
     # Thresholds per unit: Python time.sleep and shell sleep count seconds
-    # (suspicious from 100 s), JS sleep()/setTimeout milliseconds (only from
-    # 1000 s or ~17 min, otherwise every test timeout matches).
+    # (suspicious from 100 s), JS sleep() milliseconds (from 100 s) and
+    # setTimeout milliseconds (only from 1000 s or ~17 min, otherwise every
+    # test timeout matches).
     ("MAL-SANDBOX-CHECK", "MEDIUM", "Detects an analysis/test environment or delays execution (time bomb?)",
      re.compile(r"(IsDebuggerPresent|CheckRemoteDebuggerPresent|sys\.gettrace\(\)|\bVBOX\w*|VirtualBox|SbieDll|sandboxie|wine_get_unix_file_name|/proc/1/cgroup|(?<![.\w])sleep\(\s*\d{6,}\s*\)|(time|asyncio)\.sleep\(\s*\d{3,}\s*\)|(^|[;&|]\s*)sleep\s+\d{3,}\b|setTimeout\([^\n]{0,200},\s*\d{7,}\s*\)|Start-Sleep\s+(-s(econds)?\s+)?\d{3,}|(datetime\.now|datetime\.today|date\.today|new Date)\(\)[^\n]{0,40}[<>]=?\s*(datetime|date|new Date)?\(?\s*20\d\d)", I), True),
 
