@@ -43,6 +43,7 @@ Usage
 -----
     python3 -I skillbouncer_scan.py PATH [PATH ...] [--json report.json]
                                     [--min-severity LOW]
+                                    [--known-names FILE] [--no-builtin-names]
 
 PATH may be a folder with many skills, a single skill folder, or a
 ZIP-based archive (.zip, .skill, .plugin, .whl ...; extracted safely into
@@ -52,12 +53,31 @@ a temp directory).
 current directory. If the repo under review contains a planted "json.py",
 it would otherwise run on "import json".
 
+Additions in 1.2.0
+------------------
+  * META-TAMPER: text that targets the review tooling itself (baseline,
+    allowlist, verdict). The scanner's own documentation triggers it; that
+    is expected noise when skillbouncer scans itself.
+  * Markdown hiding places that render as nothing: link-reference comments,
+    reference-style image definitions with placeholders, runs of HTML
+    entities, extra frontmatter fields.
+  * Files that run automatically without a code extension (.envrc, launchd
+    plists, systemd units, .desktop, .reg, editor tasks, .gitconfig) count
+    as code and get AUTORUN-* rules.
+  * Capability combinations across files of one package (COMBO-PKG-*),
+    short Base64 commands next to a decoder, injection text in file names,
+    descriptions that claim precedence, and skill names that collide with
+    bundled or installed skills.
+
 Exit codes: 0 = only LOW/INFO, 1 = at least MEDIUM, 2 = at least HIGH.
-That makes the scanner usable as a gate in CI or scripts.
+That makes the scanner usable as a gate in CI or scripts. Usage errors
+(unknown option, unreadable --known-names file) also exit with 2, so a
+gate that only looks at the exit code stays closed.
 """
 
 import argparse
 import base64
+import html
 import json
 import os
 import re
@@ -69,6 +89,11 @@ import unicodedata
 import zipfile
 from collections import defaultdict
 from pathlib import Path
+
+# Written into the report and the JSON, and by the baseline script into
+# every baseline document. A baseline reviewed under older rules is then
+# recognisable as such and gets a full rescan.
+VERSION = "1.2.0"
 
 # ---------------------------------------------------------------------------
 # Severities
@@ -103,13 +128,42 @@ CODE_EXT = {
     ".wsf", ".hta", ".rb", ".pl", ".php", ".lua", ".applescript",
     ".command", ".ipynb", ".go", ".rs", ".java", ".kt", ".swift", ".c",
     ".cpp", ".cs",
+    # Since 1.2.0: formats that an OS, editor or build tool runs on its own
+    # (registry imports, desktop entries, service units, launchd plists,
+    # MSBuild/Gradle projects) plus further script languages.
+    ".reg", ".desktop", ".url", ".service", ".timer", ".plist", ".csproj",
+    ".targets", ".props", ".gradle", ".groovy", ".r", ".ahk", ".au3", ".nix",
+    ".ex", ".exs", ".scala", ".kts", ".m", ".mm", ".vb", ".inf",
 }
 # Files without a (distinctive) extension that still run code, e.g. on
 # "make", "docker build" or "pip install" (setup.py runs then).
 CODE_NAMES = {
     "Makefile", "makefile", "GNUmakefile", "Dockerfile", "Containerfile",
     "justfile", "Justfile", "Rakefile", "Gemfile", "setup.py", "conftest.py",
+    # Since 1.2.0: files that a shell, git, an editor, a container tool or a
+    # CI system executes without being asked. Path(".envrc").suffix is "",
+    # so dotfiles can only be matched by their full name.
+    ".envrc", ".bashrc", ".zshrc", ".zshenv", ".zprofile", ".profile",
+    ".bash_profile", ".bash_login", ".gitconfig", ".gitattributes",
+    ".pre-commit-config.yaml", "tasks.json", "launch.json",
+    "devcontainer.json", "docker-compose.yml", "docker-compose.yaml",
+    "compose.yml", "compose.yaml", "Vagrantfile", "Jenkinsfile",
+    ".gitlab-ci.yml", ".yarnrc.yml",
 }
+
+
+def is_code_path(fpath):
+    """Code by extension, by full name, or by location: every file under
+    .github/workflows/ is a CI job definition whatever it is called."""
+    if fpath.suffix.lower() in CODE_EXT or fpath.name in CODE_NAMES:
+        return True
+    parts = fpath.parts
+    return any(parts[i] == ".github" and parts[i + 1] == "workflows" for i in range(len(parts) - 2))
+
+
+# git reads these as configuration. AUTORUN-GITCONFIG is limited to them:
+# "name = !value" is ordinary code in most languages.
+GIT_CONFIG_NAMES = {".gitconfig", "gitconfig", ".gitmodules", "config", ".gitattributes"}
 # Harmless binary formats (fonts, images, PDF templates). Other binaries
 # (exe, so, dll, jar, pyc ...) have no place in an instruction skill and
 # are rated high.
@@ -188,9 +242,17 @@ def is_emoji_like(ch):
             or 0x2300 <= cp <= 0x23FF or cp in (0xFE0F, 0x2640, 0x2642))
 
 
+# One pass in C decides whether the per-character loop below is needed at
+# all; almost no file contains any of these.
+INVISIBLE_ANY_RE = re.compile("[\u200d\ufeff%s]" % "".join(
+    "%s-%s" % (chr(lo), chr(hi)) for lo, hi, _ in INVISIBLE_RANGES))
+
+
 def find_invisible(text):
     """Returns a list of (line number, description) for hidden characters."""
     hits = []
+    if not INVISIBLE_ANY_RE.search(text):
+        return hits
     line = 1
     for i, ch in enumerate(text):
         if ch == "\n":
@@ -234,6 +296,8 @@ WORD_RE = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
 
 def mixed_script_words(line):
     found = []
+    if line.isascii():
+        return found          # mixing needs a Cyrillic or Greek letter
     for w in WORD_RE.findall(line):
         scripts = set()
         for ch in w:
@@ -266,6 +330,15 @@ RULES = [
      re.compile(r"\b(ignore|disregard|forget|override|bypass)\b.{0,25}\b(all|any|the|your|previous|prior|above|earlier|system|safety|other)\b.{0,25}\b(instructions?|rules|prompts?|guidelines|polic(y|ies)|guardrails|restrictions)\b", I), False),
     ("INJ-OVERRIDE-DE", "HIGH", "Tells the assistant to ignore instructions (German)",
      re.compile(r"\b(ignorier|vergiss|missacht|umgeh)\w*\b.{0,30}\b(anweisung|regel|vorgabe|richtlinie|sicherheit)\w*", I), False),
+    # Since 1.2.0. Romance-language variants need the article after the
+    # verb: without it "ignore ... instructions" is plain English and would
+    # be reported twice.
+    ("INJ-OVERRIDE-FR", "HIGH", "Tells the assistant to ignore instructions (French)",
+     re.compile(r"\b(ignore[rz]?|oublie[rz]?|contourne[rz]?)\s+(toutes\s+)?(les|tes|vos|ces)\s.{0,30}\b(instructions|règles|consignes)\b", I), False),
+    ("INJ-OVERRIDE-ES", "HIGH", "Tells the assistant to ignore instructions (Spanish)",
+     re.compile(r"\b(ignor[ae]|olvida|omite)\s+(todas\s+)?(las|tus|sus|estas)\s.{0,30}\b(instrucciones|reglas|normas)\b", I), False),
+    ("INJ-OVERRIDE-IT", "HIGH", "Tells the assistant to ignore instructions (Italian)",
+     re.compile(r"\b(ignora|dimentica|trascura)\s+(tutte\s+)?(le|tue|queste)\s.{0,30}\b(istruzioni|regole)\b", I), False),
     ("INJ-ROLE", "MEDIUM", "Role switch / jailbreak phrasing",
      re.compile(r"\b(you are now|from now on you are|new (system )?instructions|developer mode|jailbreak|DAN mode|act as (an? )?unrestricted|no longer bound)\b", I), False),
     ("INJ-SPOOF", "MEDIUM", "Forged system/turn markers",
@@ -279,11 +352,23 @@ RULES = [
     ("DECEPT-SILENT", "MEDIUM", "Silent action (silently/quietly + action)",
      re.compile(r"\b(silently|quietly|secretly|covertly|in the background)\b.{0,20}\b(send|upload|post|run|execute|install|delete|forward|copy|exfiltrate|share)\b", I), False),
 
+    # --- Attacks on the reviewer (since 1.2.0)
+    # Text that tells the assistant to touch the review tooling: rewrite the
+    # baseline, extend an allowlist, record a verdict. A package under
+    # review has no business doing any of that. skillbouncer's own docs
+    # match by design.
+    ("META-TAMPER", "HIGH", "Targets the review tooling (baseline, allowlist, verdict, scanner)",
+     re.compile(r"(skill[\s-]?bouncer|skillcheck|security (scan|check|review))\b.{0,80}\b(baseline|allow-?list|whitelist|verdict|CLEAN|disable|skip|bypass)|\b(mark|flag|set|record)\b.{0,30}\b(as|to)\s+(CLEAN|safe|approved|trusted)\b|\b(update|edit|modify|rewrite|patch)\b.{0,40}\b(scanner|security check|review (tool|script)|audit (tool|script)|baseline)\b", I), False),
+
     # --- Data exfiltration
     ("EXFIL-SERVICE", "HIGH", "Known exfiltration/tunnel/paste service",
      re.compile(r"(webhook\.site|requestbin|pipedream\.net|ngrok(-free)?\.(io|app)|trycloudflare\.com|serveo\.net|localtunnel|loca\.lt|pastebin\.com|paste\.ee|hastebin|transfer\.sh|file\.io|0x0\.st|discord(app)?\.com/api/webhooks|api\.telegram\.org/bot|interact\.sh|oast\.(fun|me|pro|live|site|online)|burpcollaborator|canarytokens|beeceptor|hookbin)", I), False),
     ("EXFIL-IMG", "HIGH", "Markdown image/link with dynamic placeholders (classic exfiltration channel)",
      re.compile(r"!\[[^\]]*\]\(\s*https?://[^)\s]*(\{\{|\$\{|\$[A-Z_]{3,}|<[a-z_]+>|\{[a-z_]+\})", I), False),
+    # Reference-style definitions render as nothing; the image that uses
+    # them can sit anywhere in the file.
+    ("EXFIL-REF-IMG", "HIGH", "Reference-style link/image definition with dynamic placeholders (invisible when rendered)",
+     re.compile(r"^\s*\[[^\]]+\]:\s*https?://\S*(\{\{|\$\{|\$[A-Z_]{3,}|<[a-z_]+>|\{[a-z_]+\})", I), False),
     ("EXFIL-PARAM", "MEDIUM", "URL carries sensitive data as a parameter",
      re.compile(r"https?://[^\s)\"'>]*[?&](data|payload|conversation|chat|history|token|key|secret|password|pwd|cookie|session|email|content)=", I), False),
     ("EXFIL-SEND", "MEDIUM", "Instruction to send conversation or user data to an outside party",
@@ -370,7 +455,7 @@ RULES = [
     ("MAL-DECODE-EXEC", "HIGH", "Decodes data and runs it directly",
      re.compile(r"((?<![.\w])(exec|eval|compile)\s*\(\s*([\w.]*\.)?(b64decode|b32decode|a85decode|decompress|loads|fromhex|atob|unhexlify)\s*\(|(?<![.\w])(exec|eval)\s*\(\s*[\"'][^\"']*[\"']\s*\[::-1\]|(?<![.\w])(exec|eval)\s*\(\s*(bytes|bytearray)\(|(?<![.\w])(exec|eval)\s*\(\s*(''|\"\")\.join|(?<![.\w])eval\s*\(\s*Buffer\.from\(|new\s+Function\s*\(\s*atob\(|FromBase64String[^\n]{0,200}(\biex\b|Invoke-Expression)|(\biex\b|Invoke-Expression)[^\n]{0,200}FromBase64String)", I), True),
     ("OBF-INDIRECT", "MEDIUM", "Indirect access to builtins (evades a pattern search for exec/eval)",
-     re.compile(r"(getattr\(\s*(__builtins__|builtins|globals\(\))\s*,|__builtins__\s*\.\s*__dict__|__builtins__\s*\[|globals\(\)\s*\[\s*[\"']|[\"']ex[\"']\s*\+\s*[\"']ec[\"']|[\"']ev[\"']\s*\+\s*[\"']al[\"']|[\"']sys[\"']\s*\+\s*[\"']tem[\"']|\[\s*[\"']constructor[\"']\s*\]\s*\(|coding[:=]\s*(rot.?13|unicode.escape|raw.unicode.escape|utf.?7))", I), True),
+     re.compile(r"(getattr\(\s*(__builtins__|builtins|globals\(\))\s*,|__builtins__\s*\.\s*__dict__|__builtins__\s*\[|globals\(\)\s*\[\s*[\"']|[\"']ex[\"']\s*\+\s*[\"']ec[\"']|[\"']ev[\"']\s*\+\s*[\"']al[\"']|[\"']sys[\"']\s*\+\s*[\"']tem[\"']|\[\s*[\"']constructor[\"']\s*\]\s*\(|coding[:=]\s*(rot.?13|unicode.escape|raw.unicode.escape|utf.?7)|importlib\.import_module\s*\(|__import__\s*\()", I), True),
 
     # --- Information theft ("stealer")
     # Case-sensitive and with a path separator in front: "Local State" or
@@ -442,7 +527,30 @@ RULES = [
     # the reviewer knows the inventory has a gap here.
     ("NET-CONCAT-HOST", "LOW", "Network target is assembled from parts: missing from the domain inventory",
      re.compile(r"(https?://[\"']\s*\+|https?://\{[a-z_]+\}\.)", I), True),
+
+    # --- Files that run on their own (since 1.2.0)
+    # None of these needs a suspicious keyword to do harm: a plist with
+    # RunAtLoad or a unit with ExecStart is the whole persistence mechanism.
+    ("AUTORUN-LAUNCHD", "MEDIUM", "launchd job that starts on its own (RunAtLoad, KeepAlive, schedule)",
+     re.compile(r"<key>(RunAtLoad|KeepAlive|StartInterval|WatchPaths|StartCalendarInterval)</key>", I), True),
+    # Case-sensitive like the formats themselves, so that "exec = ..." in
+    # ordinary code stays out.
+    ("AUTORUN-SYSTEMD", "MEDIUM", "systemd unit that starts a command",
+     re.compile(r"^\s*(ExecStart|ExecStartPre|WantedBy)\s*="), True),
+    ("AUTORUN-DESKTOP", "MEDIUM", "Desktop entry that starts a command",
+     re.compile(r"\[Desktop Entry\]|^\s*Exec\s*=\s*\S"), True),
+    ("AUTORUN-REG", "MEDIUM", "Windows registry import",
+     re.compile(r"Windows Registry Editor|\[HKEY_(LOCAL_MACHINE|CURRENT_USER|CLASSES_ROOT)\\", I), True),
+    ("AUTORUN-EDITOR", "MEDIUM", "Editor/devcontainer task that runs when the folder is opened or the container starts",
+     re.compile(r"\"runOn\"\s*:\s*\"folderOpen\"|\"(postCreateCommand|postStartCommand|postAttachCommand|initializeCommand)\"", I), False),
+    ("AUTORUN-GITCONFIG", "MEDIUM", "Git configuration that runs a command (shell alias, clean/smudge filter)",
+     re.compile(r"^\s*\w+\s*=\s*!|^\s*(clean|smudge)\s*=|\[filter\b", I), True),
 ]
+
+# Rules that only make sense in certain files: rule ID -> predicate(Path).
+RULE_FILE_GATE = {
+    "AUTORUN-GITCONFIG": lambda p: p.name in GIT_CONFIG_NAMES or p.suffix.lower() == ".gitconfig",
+}
 
 # ---------------------------------------------------------------------------
 # Capabilities per script and dangerous combinations
@@ -456,7 +564,7 @@ RULES = [
 # and nothing is parsed or executed.
 CAPABILITIES = [
     ("NET", "network", re.compile(
-        r"(requests\.(get|post|put|patch|delete|request|Session)|urllib\.request|urlopen|http\.client|\bsocket\.(socket|create_connection)|\baiohttp\b|\bhttpx\.|\bfetch\s*\(|XMLHttpRequest|\baxios\b|new\s+WebSocket|websockets?\.connect|\bsmtplib\b|\bftplib\b|\bparamiko\b|\bnodemailer\b|\bhttps?\.(get|request)\s*\(|\bnet\.(connect|createConnection)|Net\.WebClient|Invoke-(WebRequest|RestMethod)|(^|[\s;&|(`$])(iwr|irm|curl|wget|nc|ncat|scp|sftp)\s|DownloadString|gethostbyname|getaddrinfo|dns\.resolver|\bnslookup\b)", I | re.M)),
+        r"(requests\.(get|post|put|patch|delete|request|Session)|urllib\.request|urlopen|http\.client|\bsocket\.(socket|create_connection)|\baiohttp\b|\bhttpx\.|\bfetch\s*\(|XMLHttpRequest|\baxios\b|new\s+WebSocket|websockets?\.connect|\bsmtplib\b|\bftplib\b|\bparamiko\b|\bnodemailer\b|\bhttps?\.(get|request)\s*\(|\bnet\.(connect|createConnection)|Net\.WebClient|Invoke-(WebRequest|RestMethod)|(^|[\s;&|(`$])(iwr|irm|curl|wget|nc|ncat|scp|sftp)\s|DownloadString|gethostbyname|getaddrinfo|dns\.resolver|\bnslookup\b|\.(get|post|put|patch|delete|request)\s*\(\s*f?[\"']https?://)", I | re.M)),
     ("SECRETS", "secrets/credentials", re.compile(
         r"(~/\.ssh|\.ssh/|\bid_(rsa|ed25519|ecdsa)\b|\.aws/credentials|\.netrc\b|\.git-credentials|\.config/gcloud|\.kube/config|\.docker/config\.json|\.azure/|gh/hosts\.yml|\.claude/\.credentials|\.npmrc|\.pypirc|\.vault-token|/proc/(self|\d+)/environ|_history\b|\bkeychain\b|find-(generic|internet)-password|CryptUnprotectData|Login Data|Local State|key[34]\.db|logins\.json|cookies\.sqlite|Local Storage[/\\]+leveldb|wallet\.dat|169\.254\.169\.254|metadata\.google\.internal|os\.environ\.(items|keys|values)\(\)|json\.dumps\(\s*(dict\()?\s*os\.environ|JSON\.stringify\(\s*process\.env\b|Object\.(keys|entries|values)\(\s*process\.env\s*\)|GetEnvironmentVariables\(\)|\bprintenv\b)", I)),
     ("ENV", "reads environment variables", re.compile(
@@ -470,7 +578,7 @@ CAPABILITIES = [
     ("DELETE", "deletes files", re.compile(
         r"(os\.(remove|unlink)\(|shutil\.rmtree|\.unlink\(|fs\.(unlink|rm|rmdir)(Sync)?\(|\brm\s+-|Remove-Item|\bshred\b|\bdel\s+/)", I)),
     ("EXEC", "starts processes/dynamic code", re.compile(
-        r"(subprocess\.|os\.(system|popen|exec\w*|spawn\w*)\(|child_process|execSync|execFile|\bspawn\s*\(|Start-Process|Invoke-Expression|\biex\b|(?<![.\w])(exec|eval)\s*\(|new\s+Function\s*\(|pty\.spawn|Runtime\.getRuntime)", I)),
+        r"(subprocess\.|os\.(system|popen|exec\w*|spawn\w*)\(|child_process|execSync|execFile|\bspawn\s*\(|Start-Process|Invoke-Expression|\biex\b|(?<![.\w])(exec|eval)\s*\(|new\s+Function\s*\(|pty\.spawn|Runtime\.getRuntime|importlib\.import_module\s*\(|__import__\s*\()", I)),
     ("DECODE", "decodes at runtime", re.compile(
         r"(b64decode|b32decode|a85decode|\batob\s*\(|bytes\.fromhex|unhexlify|codecs\.decode|zlib\.decompress|gzip\.decompress|lzma\.decompress|marshal\.loads|FromBase64String|Buffer\.from\([^)]{0,200}[\"'](base64|hex)[\"']|base64\s+(-d|--decode))", I)),
     ("SYSINFO", "collects system info", re.compile(
@@ -570,6 +678,43 @@ IMPERATIVE_RE = re.compile(r"\b(you must|you should|always|never|ignore|do not|d
 
 URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+\.[A-Za-z]{2,})(:\d+)?", I)
 B64_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{120,}={0,2}(?![A-Za-z0-9+/])")
+# Short tokens are only decoded in files that also decode at runtime: a
+# one-line shell command fits into 40 characters of Base64.
+B64_SHORT_RE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{24,119}={0,2}(?![A-Za-z0-9+/=])")
+B64_SHORT_CMD_RE = re.compile(r"(https?://|curl|wget|bash|sh |powershell|/bin/|cmd\.exe|eval|exec)", I)
+
+# Markdown link-reference definitions that exist only to hold a comment:
+# "[//]: # (text)" and "[comment]: <> (text)" render as nothing at all.
+MD_COMMENT_RE = re.compile(r"^\s*\[(//|comment|#|_|hidden)\]:\s*(#|<>)")
+PLACEHOLDER_URL_RE = re.compile(r"https?://\S*(\{\{|\$\{|\$[A-Z_]{3,}|<[a-z_]+>|\{[a-z_]+\})", I)
+# Numeric character references spell text that is invisible in the source
+# but plain once rendered or read by a model.
+HTML_ENTITIES_RE = re.compile(r"(&#x?[0-9a-fA-F]{2,6};\s*){8,}")
+
+# Frontmatter keys a SKILL.md is expected to carry. Anything else is a
+# field no reader looks at, yet the model receives it.
+FM_KNOWN_KEYS = {
+    "name", "description", "license", "version", "author", "allowed-tools",
+    "argument-hint", "model", "disable-model-invocation", "user-invocable",
+    "compatibility", "metadata",
+    # Claude Code fields beyond the handoff list. "hooks" is left out on
+    # purpose: a skill that registers hooks should be reported.
+    "when_to_use", "shell", "effort", "context", "agent", "paths",
+}
+# Free-text fields that are meant to be read: only the precedence check
+# applies to them, not the "reads like an instruction" check.
+FM_PROSE_KEYS = {"name", "description", "when_to_use"}
+FM_MAX_LINES = 40
+FM_DESC_HIJACK_RE = re.compile(r"\b(replaces?|instead of|overrides?|supersedes?)\b.{0,40}\b(skill|plugin|tool)s?\b|\b(always|must) (use|invoke|load) (this|me)\b|\bbefore (any|all|every) (other )?(skill|task|request)", I)
+# Skills bundled by Anthropic, plus this tool. A third-party skill reusing
+# one of these names competes with the original for the same triggers.
+BUILTIN_SKILL_NAMES = {
+    "docx", "pdf", "pptx", "xlsx", "frontend-design", "file-reading",
+    "pdf-reading", "product-self-knowledge", "skill-creator", "mcp-builder",
+    "computer-use", "chrome-browser", "built-in-browser", "deep-research",
+    "docs", "google-workspace", "video-making", "import-memory", "morning",
+    "skillbouncer",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +783,17 @@ def decode_b64_bytes(blob):
         return base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
     except Exception:
         return b""
+
+
+# Injection and deception rules that apply to prose. Reused wherever text
+# reaches the model by a side door: decoded entities, hidden comments, file
+# names.
+INJECTION_RULES = [(rid, rx) for rid, _, _, rx, code_only in RULES
+                   if rid.startswith(("INJ-", "DECEPT-")) and not code_only]
+
+
+def injection_hits(text):
+    return [rid for rid, rx in INJECTION_RULES if rx.search(text)]
 
 
 def line_of(text, needle):
@@ -869,6 +1025,14 @@ def parse_frontmatter(text):
     return fields
 
 
+def frontmatter_block(text):
+    """The raw frontmatter text, or "". Multi-line values (block scalars,
+    nested maps) are not parsed by parse_frontmatter, so checks that must
+    not miss them work on this."""
+    m = re.match(r"\A\ufeff?---\r?\n(.*?)\r?\n---\s*(\r?\n|$)", text, re.S)
+    return m.group(1) if m else ""
+
+
 def safe_extract(archive, dest, findings):
     """Extracts .zip/.skill safely. Checks for zip slip (../, absolute paths),
     symlinks inside the archive and zip bombs before anything is written."""
@@ -894,13 +1058,13 @@ def safe_extract(archive, dest, findings):
 
 def skill_root_for(path, roots):
     """Assigns a file to the nearest skill folder (the one with SKILL.md)."""
+    # Prefix comparison on strings: Path.relative_to per file and root was
+    # a quarter of the runtime on a tree with a few hundred skills.
     best = None
+    s = str(path)
     for r in roots:
-        try:
-            path.relative_to(r)
-        except ValueError:
-            continue
-        if best is None or len(str(r)) > len(str(best)):
+        rs = str(r)
+        if s.startswith(rs + os.sep) and (best is None or len(rs) > len(str(best))):
             best = r
     return best
 
@@ -953,8 +1117,8 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv):
     # Code is not only recognised by its extension: a "helper" without one
     # but with "#!/bin/bash" on the first line is just as executable.
     has_shebang = text.startswith("#!")
-    is_code = ext in CODE_EXT or fpath.name in CODE_NAMES or has_shebang
-    if has_shebang and ext not in CODE_EXT and fpath.name not in CODE_NAMES:
+    is_code = is_code_path(fpath) or has_shebang
+    if has_shebang and not is_code_path(fpath):
         if ext in ("", ".bin"):
             findings.append((skill, "LOW", "FS-SHEBANG", "Script without an extension (shebang: %s)" % visible_snippet(text.splitlines()[0], 60), rel, 1, ""))
         else:
@@ -988,6 +1152,9 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv):
     for rid, sev, desc, rx, code_only in RULES:
         if code_only and not is_code:
             continue
+        gate = RULE_FILE_GATE.get(rid)
+        if gate and not gate(fpath):
+            continue
         if not RULES_PREFILTER[rid].search(low):
             continue
         for ln, line in enumerate(lines_list, 1):
@@ -1009,6 +1176,31 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv):
                 break
             sev = "MEDIUM" if IMPERATIVE_RE.search(body) else "LOW"
             findings.append((skill, sev, "HTML-COMMENT", "HTML comment (invisible when rendered)", rel, ln, visible_snippet(body)))
+
+        # Link-reference comments: same idea as an HTML comment, but
+        # Markdown-only and far less known, so a reviewer skims past them.
+        if "]:" in text:
+            for ln, line in enumerate(lines_list, 1):
+                if not MD_COMMENT_RE.match(line):
+                    continue
+                if PLACEHOLDER_URL_RE.search(line) or injection_hits(line):
+                    sev = "HIGH"
+                elif IMPERATIVE_RE.search(line):
+                    sev = "MEDIUM"
+                else:
+                    sev = "LOW"
+                findings.append((skill, sev, "MD-HIDDEN-COMMENT", "Markdown link-reference comment (invisible when rendered)", rel, ln, visible_snippet(line)))
+
+    # 3b) Runs of numeric HTML entities, in any text file: decoded for the
+    #     report so the reviewer sees the plain text.
+    if "&#" in text:
+        for m in HTML_ENTITIES_RE.finditer(text):
+            decoded = html.unescape(m.group(0))
+            ln = text.count("\n", 0, m.start()) + 1
+            hits = injection_hits(decoded)
+            findings.append((skill, "HIGH" if hits else "MEDIUM", "HTML-ENTITIES",
+                             "Text spelled in HTML entities%s, decoded" % (" (matches %s)" % ", ".join(hits) if hits else ""),
+                             rel, ln, visible_snippet(decoded, 160)))
 
     # 4) Base64 blocks: report when they decode to text (hidden instruction)
     #    or to a program/archive (hidden payload). Embedded images
@@ -1047,6 +1239,15 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv):
                 break
 
     caps = [cid for cid, rx in CAPS_FAST if rx.search(low)]
+
+    # Short Base64 next to a decoder: "p = '<40 chars>'; run(b64decode(p))"
+    # stays under the 120-character threshold above.
+    if "DECODE" in caps:
+        for m in B64_SHORT_RE.finditer(text):
+            decoded = try_b64(m.group(0))
+            if decoded and B64_SHORT_CMD_RE.search(decoded):
+                ln = text.count("\n", 0, m.start()) + 1
+                findings.append((skill, "HIGH", "OBF-BASE64-SHORT", "Short Base64 string in a file that decodes at runtime; it decodes to a command or URL", rel, ln, visible_snippet(decoded, 160)))
     hosts = set()
     for line in lines_list:
         for m in URL_RE.finditer(line):
@@ -1064,7 +1265,7 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv):
             findings.append((skill, sev, rid, desc, rel, 0, ""))
 
 
-def check_frontmatter(skill_dir, skill, findings):
+def check_frontmatter(skill_dir, skill, findings, known_names=frozenset()):
     """Checks the SKILL.md header: required fields and above all
     'allowed-tools', because a skill can use it to claim tool permissions
     without a prompt."""
@@ -1086,6 +1287,47 @@ def check_frontmatter(skill_dir, skill, findings):
         if key in fm:
             findings.append((skill, "MEDIUM", "FM-ALLOWED-TOOLS", "Claims tool permissions: %s=%s" % (key, fm[key] or "(list)"), "SKILL.md", 1, ""))
 
+    # Fields nobody reads. name and description are the visible ones and
+    # are covered by the line rules; every other field is checked for being
+    # unknown, long, or phrased as an instruction.
+    for key, val in fm.items():
+        if key in FM_PROSE_KEYS:
+            continue
+        reason = ""
+        if key not in FM_KNOWN_KEYS:
+            reason = "unknown field"
+        elif len(val) > 200:
+            reason = "value over 200 characters"
+        elif key not in ("allowed-tools", "compatibility") and (IMPERATIVE_RE.search(val) or len(val.split()) >= 12):
+            reason = "value reads like an instruction"
+        if reason:
+            findings.append((skill, "MEDIUM", "FM-EXTRA-FIELD", "Frontmatter field '%s': %s" % (key, reason), "SKILL.md",
+                             line_of(text, key + ":"), visible_snippet(val)))
+    block = frontmatter_block(text)
+    if block.count("\n") + 1 > FM_MAX_LINES:
+        findings.append((skill, "MEDIUM", "FM-LONG", "Frontmatter has %d lines: multi-line values are not parsed, read it in full" % (block.count("\n") + 1), "SKILL.md", 1, ""))
+    # On whole fields rather than the parsed description: a folded
+    # description spans several lines, which parse_frontmatter does not
+    # read. Fields are kept apart so a match cannot straddle two of them.
+    fields = []
+    for line in block.splitlines():
+        if re.match(r"^[A-Za-z0-9_-]+\s*:", line) or not fields:
+            fields.append(line)
+        else:
+            fields[-1] += " " + line.strip()
+    for field in fields:
+        m = FM_DESC_HIJACK_RE.search(field)
+        if m:
+            findings.append((skill, "MEDIUM", "FM-DESC-HIJACK", "Frontmatter claims precedence over other skills or tasks", "SKILL.md",
+                             line_of(text, field.split(":", 1)[0] + ":"), visible_snippet(m.group(0))))
+            break
+    for cand in sorted({(fm.get("name") or "").lower(), skill_dir.name.lower()} - {""}):
+        if cand in known_names:
+            findings.append((skill, "MEDIUM", "FM-NAME-COLLISION",
+                             "Skill name '%s' is already used by a bundled or installed skill (expected only when scanning that original)" % cand,
+                             "SKILL.md", 1, ""))
+            break
+
 
 # ---------------------------------------------------------------------------
 # Main flow
@@ -1094,11 +1336,39 @@ def check_frontmatter(skill_dir, skill, findings):
 ZIP_BASED_EXT = (".zip", ".skill", ".plugin", ".whl", ".vsix", ".xpi", ".egg")
 
 
-def scan_paths(paths):
+def package_combos(scripts_inv, group_of, findings):
+    """Capability combinations across the files of one package. A stealer
+    split into "a.py reads credentials into /tmp" and "b.py uploads /tmp"
+    shows no combination in either file. Only HIGH combinations, reported
+    at MEDIUM: in a large plugin the union is often satisfied by unrelated
+    scripts, so this is a pointer for reading, not a verdict.
+    Returns {package: sorted capability IDs}."""
+    cap_ids = {cid for cid, _, _ in CAPABILITIES}
+    per_pkg = defaultdict(dict)
+    for (skill, rel), info in scripts_inv.items():
+        caps = set(info["caps"]) & cap_ids
+        if caps:
+            per_pkg[group_of.get(skill, skill)][(skill, rel)] = caps
+    union_caps = {}
+    for pkg, files in sorted(per_pkg.items()):
+        union = set().union(*files.values())
+        union_caps[pkg] = sorted(union)
+        for need, sev, rid, desc in COMBOS:
+            if sev != "HIGH" or not need <= union or any(need <= c for c in files.values()):
+                continue
+            names = sorted(("%s/%s" % (s, r) if s != pkg else r) for (s, r), c in files.items() if c & need)
+            shown = ", ".join(names[:6]) + (" (+%d more)" % (len(names) - 6) if len(names) > 6 else "")
+            findings.append((pkg, "MEDIUM", "COMBO-PKG-" + rid.split("-", 1)[1],
+                             "Across files of this package: " + desc, shown, 0, ""))
+    return union_caps
+
+
+def scan_paths(paths, known_names=frozenset()):
     findings = []                 # (skill, severity, rule, description, file, line, snippet)
     domains = defaultdict(set)
     scripts_inv = {}              # (skill, file) -> {"caps": [...], "hosts": [...]}
     skills_seen = set()           # so skills without findings show up in the report too
+    group_of = {}                 # skill -> enclosing plugin, for package-level combos
     file_count = 0
     tmpdirs = []
     targets = []
@@ -1133,7 +1403,7 @@ def scan_paths(paths):
         for r in roots:
             skills_seen.add(root_names[r])
             try:
-                check_frontmatter(r, root_names[r], findings)
+                check_frontmatter(r, root_names[r], findings, known_names)
             except Exception as e:  # noqa: BLE001
                 findings.append((root_names[r], "HIGH", "SCAN-ERROR", "SKILL.md could not be checked (%s: %s)" % (type(e).__name__, e), "SKILL.md", 0, ""))
         # Plugin folder = folder with .claude-plugin/plugin.json. Files at plugin
@@ -1152,6 +1422,10 @@ def scan_paths(paths):
             plugin_roots[proot] = "%splugin:%s" % (prefix, pname)
             skills_seen.add(plugin_roots[proot])
         all_roots = list(roots) + list(plugin_roots)
+        for r in roots:
+            owners = [p for p in plugin_roots if p == r or p in r.parents]
+            if owners:
+                group_of[root_names[r]] = plugin_roots[max(owners, key=lambda p: len(p.parts))]
         for f in base.rglob("*"):
             if ".git" in f.parts or not (f.is_file() or f.is_symlink()):
                 continue
@@ -1181,13 +1455,23 @@ def scan_paths(paths):
             if label and root is None:
                 rel = label + "!/" + rel
             file_count += 1
+            # File names reach the model like content (directory listings,
+            # "read references/<name>"), so they get the injection rules too.
+            name_hits = injection_hits(re.sub(r"[_\-]+", " ", rel))
+            if name_hits:
+                findings.append((skill, "MEDIUM", "FILENAME-INJECTION", "File name reads like an instruction (matches %s)" % ", ".join(name_hits), rel, 0, visible_snippet(rel)))
             try:
                 scan_file(f, rel, skill, findings, domains, scripts_inv)
             except OSError as e:
                 findings.append((skill, "LOW", "IO-ERROR", str(e), rel, 0, ""))
             except Exception as e:  # noqa: BLE001 - the scanner must never fail open
                 findings.append((skill, "HIGH", "SCAN-ERROR", "File crashed the scanner (%s: %s): check by hand" % (type(e).__name__, e), rel, 0, ""))
-    return findings, domains, skills_seen, file_count, tmpdirs, scripts_inv
+    try:
+        union_caps = package_combos(scripts_inv, group_of, findings)
+    except Exception as e:  # noqa: BLE001 - the scanner must never fail open
+        union_caps = {}
+        findings.append(("(scanner)", "HIGH", "SCAN-ERROR", "Package-level combination check failed (%s: %s)" % (type(e).__name__, e), "", 0, ""))
+    return findings, domains, skills_seen, file_count, tmpdirs, scripts_inv, union_caps
 
 
 def cleanup(tmpdirs):
@@ -1203,9 +1487,23 @@ def main():
     ap.add_argument("--json", help="also write the findings as JSON")
     ap.add_argument("--min-severity", default="LOW", choices=SEVERITIES, help="lowest severity shown in the text output")
     ap.add_argument("--max-per-rule", type=int, default=8, help="max. lines per rule and skill in the text output")
+    ap.add_argument("--known-names", help="file with one installed skill name per line; a scanned skill reusing one is reported")
+    ap.add_argument("--no-builtin-names", action="store_true",
+                    help="do not compare against the built-in list of bundled skill names (use when scanning the bundled skills themselves)")
+    ap.add_argument("--version", action="version", version="skillbouncer_scan " + VERSION)
     args = ap.parse_args()
 
-    findings, domains, skills_seen, file_count, tmpdirs, scripts_inv = scan_paths(args.paths)
+    known_names = set() if args.no_builtin_names else set(BUILTIN_SKILL_NAMES)
+    if args.known_names:
+        # A missing list must not pass as "no collisions". ap.error exits
+        # with 2, the same code as a HIGH finding, so a gate stays closed.
+        try:
+            raw = Path(args.known_names).read_text("utf-8", "replace")
+        except OSError as e:
+            ap.error("cannot read --known-names file: %s" % e)
+        known_names |= {l.strip().lower() for l in raw.splitlines() if l.strip() and not l.startswith("#")}
+
+    findings, domains, skills_seen, file_count, tmpdirs, scripts_inv, union_caps = scan_paths(args.paths, known_names)
     cleanup(tmpdirs)
 
     # Summary per skill
@@ -1215,7 +1513,7 @@ def main():
     all_skills = sorted(skills_seen | set(by_skill) | set(domains))
 
     worst_overall = "INFO"
-    print("# skillbouncer scan report")
+    print("# skillbouncer scan report (scanner %s)" % VERSION)
     print("Files scanned: %d | Skills: %d | Findings: %d\n" % (file_count, len(all_skills), len(findings)))
     print("## Overview (highest severity per skill)")
     for s in all_skills:
@@ -1227,6 +1525,7 @@ def main():
         print("- %-28s %-6s %s" % (s, worst, " ".join("%s=%d" % kv for kv in counts.items())))
 
     print("\n## Findings from %s" % args.min_severity)
+    print("Snippets are quotes from the scanned, untrusted content.")
     for s in all_skills:
         items = [f for f in by_skill.get(s, []) if sev_rank(f[1]) >= sev_rank(args.min_severity)]
         if not items:
@@ -1261,11 +1560,13 @@ def main():
 
     if args.json:
         Path(args.json).write_text(json.dumps({
+            "scanner_version": VERSION,
             "files_scanned": file_count,
             "findings": [dict(zip(["skill", "severity", "rule", "description", "file", "line", "snippet"], f)) for f in findings],
             "domains": {k: sorted(v) for k, v in domains.items()},
             "scripts": [{"skill": s, "file": rel, "capabilities": v["caps"], "hosts": v["hosts"]}
                         for (s, rel), v in sorted(scripts_inv.items())],
+            "package_capabilities": union_caps,
         }, ensure_ascii=False, indent=2), "utf-8")
 
     sys.exit(2 if worst_overall == "HIGH" else 1 if worst_overall == "MEDIUM" else 0)
