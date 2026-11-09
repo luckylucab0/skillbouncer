@@ -21,7 +21,7 @@ Compare the output with the hashes from the prompt yourself. `sha256sum` is a sy
 python3 -I <skill>/scripts/skillbouncer_baseline.py selfcheck --expect <hash>:skillbouncer_scan.py,<hash>:skillbouncer_baseline.py,<hash>:SKILL.md
 ```
 
-Exit code 2 means a mismatch or a missing hash. On any mismatch: stop, change nothing in the baseline, and send the user a HIGH message naming the file. If the prompt has no hashes, run the check with `selfcheck --print`, report the hashes and say that this run was not verified.
+Exit code 2 means a mismatch, a missing hash or a hash for a file the check does not cover (pass exactly these three). On any mismatch: stop, change nothing in the baseline, and send the user a HIGH message naming the file. If the prompt has no hashes, run the check with `selfcheck --print`, report the hashes and say that this run was not verified.
 
 The hashes change with every skillbouncer update. After installing a new version, the user produces them from the reviewed source and puts them into the prompt:
 
@@ -51,9 +51,10 @@ python3 -I <skill>/scripts/skillbouncer_baseline.py diff --baseline-dir <work>/b
 
 - **Exit code 2 or zero units is an error.** Record the run as failed and tell the user. Never record "no changes" for a snapshot that found nothing.
 - If plugins are installed but no plugin root shows up, the install location has moved. Find it, pass it with `--root <dir>`, and mention it in the result.
-- The same skill installed in several roots counts once when the copies are identical. A copy that differs appears as `skill:<name>@<root>`; that difference is a finding of its own (MEDIUM), review the differing files.
+- The same skill installed in several roots counts once when the copies are identical. A copy that differs appears as `skill:<name>@<root>` (further ones as `skill:<name>@<root>-2` and so on); that difference is a finding of its own (MEDIUM), review the differing files.
+- A skill or plugin installed as a symlink is recorded at the folder the link points to. An `uncovered` line names any other symlink whose target is not part of the snapshot. If that target is a folder with skills or plugins, pass it with `--root <dir>` and mention it in the result.
 
-`diff` exits 0 when there is nothing to review and 1 otherwise. If it prints nothing new or changed and no rescan notice: go to step 5 and record the run as "OK, no changes".
+`diff` exits 0 when there is nothing to review, 1 otherwise and 2 on an error (no result; record the run as failed). If it prints nothing new, changed or removed, no `LINK` line and no rescan notice: go to step 5 and record the run as "OK, no changes".
 
 ## 3. Review what changed
 
@@ -64,7 +65,8 @@ python3 -I <skill>/scripts/skillbouncer_baseline.py diff --baseline-dir <work>/b
 - Read every entry in `to_review` in full. Beyond about 300 KB split the work across review agents (prompt: `references/review-prompt.md`, scope limited to the changed files plus their SKILL.md). An agent's CLEAN does not disposition a scanner HIGH; write down the reason yourself.
 - Analyse new or changed scripts, hooks, MCP configurations, auto-run files and install manifests (`package.json`, `requirements*.txt`, `setup.py`) in full following `references/script-analysis.md`. The baseline holds hashes only, not the old code. If the previous version is at hand (Git history of the source repo, a marketplace diff), compare the script inventory of both states; otherwise check the inventory of the new state against the purpose. New network targets, new capabilities (network or credential access for the first time) and new dependencies are the real warning signs of a compromised update.
 - Plausibility: does the change fit a normal update (version bump in `plugin.json` or `manifest.json`, a new `updatedAt`, content that fits the topic)? A change without a version bump, a new `.mcp.json`, new scripts with network access or new binaries are always at least MEDIUM. **A new or changed hook is always PENDING**: it ran before this check did.
-- Only record removed units (the user probably uninstalled them).
+- `LINK` lines (`uncovered_links` in `diff.json`) are symlinks whose target is not part of the snapshot. They are reported on every run, changed or not, because nothing compares what they point to. Read the target and say in the result that it is not covered by the baseline.
+- Removed units (`removed` in `diff.json`) make `diff` exit 1. Check the root list from step 2 first: if a whole install location is missing, every unit in it shows up as removed, and that is an error like an empty snapshot. Otherwise only record them (the user probably uninstalled them).
 
 ## 4. Verdict and baseline
 

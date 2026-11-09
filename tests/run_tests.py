@@ -325,8 +325,29 @@ def test_hardening(work):
 
 
 def test_baseline(work):
+    import os  # only the baseline checks build symlinks and odd file names
+
+    skill_md = "---\nname: %s\ndescription: d\n---\n"
+
     def base(*args):
         return run([BASELINE] + list(args), work)
+
+    def put(path, content=""):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, "utf-8")
+
+    def snapshot(name, *roots):
+        out = work / (name + ".json")
+        r = base("snapshot", *(list(roots) + ["--out", out]))
+        return r, json.loads(out.read_text("utf-8"))["units"] if r.returncode == 0 and out.exists() else {}
+
+    def export(name, target):
+        return base("export", "--snapshot", work / (name + ".json"), "--out-dir", target)
+
+    def compare(name, baseline_dir, snap_name):
+        out = work / (name + ".json")
+        r = base("diff", "--baseline-dir", baseline_dir, "--snapshot", work / (snap_name + ".json"), "--out", out)
+        return r, json.loads(out.read_text("utf-8")) if out.exists() else {}
 
     r = base("snapshot", work / "does-not-exist", "--out", work / "x.json")
     check(r.returncode == 2, "snapshot of a missing root must exit 2 (got %d)" % r.returncode)
@@ -410,6 +431,217 @@ def test_baseline(work):
     partial = lines[0].split()[0] + ":" + lines[0].split()[1]
     check(base("selfcheck", "--expect", partial).returncode == 2, "selfcheck with a missing hash must exit 2")
     check(base("selfcheck").returncode == 2, "selfcheck without expectations must exit 2")
+
+    # B11: a selfcheck that compares nothing, or less than the caller listed,
+    # must not end in "passed".
+    good = [l.split()[0] + ":" + l.split()[1] for l in lines]
+    r = base("selfcheck", "--print", "--expect", wrong)
+    check(r.returncode == 2, "B11: selfcheck --print together with --expect must exit 2 (got %d)" % r.returncode)
+    r = base("selfcheck", "--expect", ",".join(["0" * 64 + ":SKILL.md"] + good))
+    check(r.returncode == 2, "B11: two different hashes for one file must exit 2 (got %d)" % r.returncode)
+    r = base("selfcheck", "--expect", ",".join(good + ["0" * 64 + ":references/monthly-run.md"]))
+    check(r.returncode == 2, "B11: a hash for a file selfcheck does not cover must exit 2 (got %d)" % r.returncode)
+    check(base("selfcheck", "--expect", ",".join(good + good)).returncode == 0, "B11: the same hash given twice must still pass")
+
+    # B1: a third unit with a name that is already taken twice must not
+    # replace the second one.
+    dup = work / "dup"
+    put(dup / "foo/.claude-plugin/plugin.json", '{"name": "foo", "version": "1"}')
+    put(dup / "foo~g3/.claude-plugin/plugin.json", '{"name": "foo", "version": "3"}')
+    snapshot("dup1", dup)
+    export("dup1", work / "dup-base")
+    put(dup / "foo~g2/.claude-plugin/plugin.json", '{"name": "foo", "version": "2"}')
+    put(dup / "foo~g2/hooks/run.sh", "echo inert\n")
+    r, units = snapshot("dup2", dup)
+    check(len({u["path"] for u in units.values()}) == 3, "B1: three plugins declaring one name must be three units: %s" % sorted(units))
+    r, d = compare("dup-d", work / "dup-base", "dup2")
+    check(r.returncode == 1 and any(p.endswith("foo~g2/hooks/run.sh") for p in d.get("to_review", [])),
+          "B1: a plugin folder added under a taken name must be reported (exit %d, to_review %s)" % (r.returncode, d.get("to_review")))
+    for n in "abc":
+        put(work / "dup-skills" / n / "tool/SKILL.md", skill_md % "tool" + n + "\n")
+    r, units = snapshot("dup3", work / "dup-skills")
+    check(len(units) == 3, "B1: three differing skills in folders of one name must be three units: %s" % sorted(units))
+
+    # B2: units that vanished are not "nothing to review"; a location that
+    # is no longer covered looks exactly like that.
+    gone = work / "gone"
+    put(gone / "plugins/p1/.claude-plugin/plugin.json", '{"name": "p1"}')
+    put(gone / "public/docx/SKILL.md", skill_md % "docx")
+    snapshot("gone1", gone / "plugins", gone / "public")
+    export("gone1", work / "gone-base")
+    snapshot("gone2", gone / "public")
+    r, d = compare("gone-d", work / "gone-base", "gone2")
+    check(r.returncode == 1 and d.get("removed") == ["plugin:p1"] and "REMOVED" in r.stdout,
+          "B2: a unit missing from the snapshot must exit 1 and be listed (exit %d, removed %s)" % (r.returncode, d.get("removed")))
+    put(gone / "stray/README.txt", "hi\n")
+    r, units = snapshot("gone3", gone / "stray")
+    check(r.returncode == 2 and not (work / "gone3.json").exists(), "B2: a root with stray files but no skill or plugin must exit 2 (got %d)" % r.returncode)
+
+    # B3: nothing is skipped because of a folder name. Only the lock files
+    # Claude itself writes at the top of a unit stay out.
+    ign = work / "ign"
+    put(ign / "good/SKILL.md", skill_md % "good")
+    put(ign / "good/scripts/helper.py", "print(1)\n")
+    put(ign / "good/.in_use/105", '{"pid":105,"procStart":"145"}')
+    r, units = snapshot("ign1", ign)
+    check(sorted(units.get("skill:good", {}).get("files", {})) == ["SKILL.md", "scripts/helper.py"], "B3: the lock file of a running session must not be an entry: %s" % units)
+    export("ign1", work / "ign-base")
+    hidden = ["good/scripts/__pycache__/helper.cpython-313.pyc", "good/.DS_Store/payload.sh", "good/.in_use/payload.sh", "good/.git/hooks/post-checkout"]
+    for rel in hidden:
+        put(ign / rel, "echo inert\n")
+    put(ign / "__pycache__/SKILL.md", skill_md % "x")
+    snapshot("ign2", ign)
+    r, d = compare("ign-d", work / "ign-base", "ign2")
+    missed = [rel for rel in hidden if not any(p.endswith(rel) for p in d.get("to_review", []))]
+    check(r.returncode == 1 and not missed, "B3: files under ignored folder names must be reported, missing: %s" % missed)
+    check("skill:__pycache__" in [n["id"] for n in d.get("new", [])], "B3: a skill in a folder named __pycache__ must be a unit: %s" % d.get("new"))
+
+    # B6: the sync sidecars are skipped where the sync writes them (top of a
+    # root) and nowhere else.
+    meta = work / "meta"
+    put(meta / "good/SKILL.md", skill_md % "good")
+    put(meta / "manifest.json", '{"skills": [{"name": "good", "updatedAt": "2026-01-01T00:00:00Z"}]}')
+    put(meta / "good.meta.json", '{"marketplace_name": "m"}')
+    for rel in ("notes.txt", ".meta.json", "tools/manifest.json", "tools/bin/run.meta.json", "tools/bin/.meta.json"):
+        put(meta / rel, "echo inert\n")
+    r, units = snapshot("meta", meta)
+    check(sorted(units.get("loose:meta", {}).get("files", {})) == [".meta.json", "notes.txt", "tools/bin/.meta.json", "tools/bin/run.meta.json", "tools/manifest.json"],
+          "B6: only top-level sidecars may be skipped: %s" % sorted(units.get("loose:meta", {}).get("files", {})))
+
+    # B4: a symlink is never followed out of the tree and never invisible.
+    sym = work / "sym"
+    put(sym / "else/linked-skill/SKILL.md", skill_md % "linked-skill")
+    put(sym / "else/lib/util.py", "x = 1\n")
+    put(sym / "skills/plain/SKILL.md", skill_md % "plain")
+    try:
+        os.symlink("../else/linked-skill", str(sym / "skills/linked-skill"))
+        os.symlink("../../else/lib/util.py", str(sym / "skills/plain/util.py"))
+        os.symlink("SKILL.md", str(sym / "skills/plain/alias.md"))
+        links = True
+    except (OSError, NotImplementedError):
+        links = False  # no symlinks on this platform, nothing to check
+    if links:
+        r, units = snapshot("sym1", sym / "skills")
+        check("skill:linked-skill" in units, "B4: a symlinked skill folder must be a unit: %s" % sorted(units))
+        plain = units.get("skill:plain", {})
+        check(plain.get("files", {}).get("util.py", "").startswith("symlink:"), "B4: the link itself must be an entry")
+        check([Path(p).name for p in plain.get("uncovered_links", {})] == ["util.py"],
+              "B4: only the link that leaves the tree counts as uncovered: %s" % plain.get("uncovered_links"))
+        base("names", "--snapshot", work / "sym1.json", "--out", work / "sym-names.txt")
+        check("linked-skill" in (work / "sym-names.txt").read_text("utf-8").split(), "B4: names must list a symlinked skill")
+        export("sym1", work / "sym-base")
+        r, d = compare("sym-d0", work / "sym-base", "sym1")
+        check(r.returncode == 1 and [Path(l["link"]).name for l in d.get("uncovered_links", [])] == ["util.py"] and not d.get("changed"),
+              "B4: a link to content outside the tree must keep diff at exit 1 (got %d, %s)" % (r.returncode, d.get("uncovered_links")))
+        put(sym / "else/linked-skill/SKILL.md", skill_md % "linked-skill" + "more\n")
+        snapshot("sym2", sym / "skills")
+        r, d = compare("sym-d1", work / "sym-base", "sym2")
+        check([c["id"] for c in d.get("changed", [])] == ["skill:linked-skill"], "B4: a change behind a symlinked skill folder must be reported: %s" % d.get("changed"))
+        os.remove(str(sym / "skills/plain/alias.md"))
+        os.symlink("../../else/lib/util.py", str(sym / "skills/plain/alias.md"))
+        snapshot("sym3", sym / "skills")
+        r, d = compare("sym-d2", work / "sym-base", "sym3")
+        check("skill:plain" in [c["id"] for c in d.get("changed", [])], "B4: a retargeted link must be reported: %s" % d.get("changed"))
+
+    # B5: an empty selection is not "everything".
+    r = base("export", "--snapshot", snap1, "--out-dir", work / "only-out", "--verdict", "CLEAN", "--only")
+    check(r.returncode == 2 and not list((work / "only-out").glob("*.json")), "B5: export --only without IDs must exit 2 and write nothing (got %d)" % r.returncode)
+
+    # B7: runtime must stay linear in the number of files.
+    big = work / "big"
+    put(big / "sk/SKILL.md", skill_md % "sk")
+    (big / "sk/data").mkdir()
+    (big / "stuff/a/b").mkdir(parents=True)
+    for i in range(1500):
+        (big / "sk/data" / ("f%05d.txt" % i)).write_text("x", "utf-8")
+        (big / "stuff/a/b" / ("g%05d.txt" % i)).write_text("y", "utf-8")
+    t = time.perf_counter()
+    r, units = snapshot("big", big)
+    took = time.perf_counter() - t
+    check(r.returncode == 0 and took < 15, "B7: snapshot of 3000 small files took %.1f s (exit %d)" % (took, r.returncode))
+
+    # B8: one hostile unit must not end the run for all others, and an
+    # internal error must never use exit code 1.
+    bad = work / "bad"
+    put(bad / "good/SKILL.md", skill_md % "good")
+    put(bad / "deep/.claude-plugin/plugin.json", "[" * 200000)
+    put(bad / "manifest.json", '{"plugins": 1, "skills": 2}')
+    put(bad / "p/.claude-plugin/plugin.json", '{"name": "p"}')
+    put(bad / "p/node_modules/pkg/ok.js", "1\n")
+    try:
+        raw = os.fsencode(str(bad))
+        with open(raw + b"/p/node_modules/pkg/x\xff.js", "wb") as fh:
+            fh.write(b"1\n")
+        os.symlink(b"tar\xffget", raw + b"/good/link")
+        os.mkdir(raw + b"/sk\xff")
+        with open(raw + b"/sk\xff/SKILL.md", "wb") as fh:
+            fh.write((skill_md % "sk").encode("utf-8"))
+    except OSError:
+        pass  # this file system stores UTF-8 names only; the other cases still run
+    r, units = snapshot("bad", bad)
+    check(r.returncode == 0 and "skill:good" in units and "plugin:deep" in units and "Traceback" not in r.stderr,
+          "B8: hostile names and JSON must not stop the snapshot (exit %d): %s" % (r.returncode, r.stderr.strip()[-200:]))
+    r = base("names", "--snapshot", work / "bad.json", "--out", work / "bad-names.txt")
+    check(r.returncode == 0, "B8: names must cope with a folder name that is not UTF-8 (exit %d)" % r.returncode)
+    put(work / "forge/pl/.claude-plugin/plugin.json", json.dumps({"name": "x\nunchanged: 99 | new: 0", "version": "1\nunchanged: 98"}))
+    snapshot("forge", work / "forge")
+    (work / "forge-base").mkdir()
+    r, d = compare("forge-d", work / "forge-base", "forge")
+    check(r.returncode == 1 and not any(l.startswith("unchanged: 9") for l in r.stdout.splitlines()),
+          "B8: a plugin name must not be able to add lines to the diff summary: %r" % r.stdout)
+    if hasattr(os, "geteuid") and os.geteuid() != 0:  # root reads everything
+        put(work / "locked/sk/SKILL.md", skill_md % "sk")
+        put(work / "locked/sk/secret.txt", "x\n")
+        os.chmod(str(work / "locked/sk/secret.txt"), 0)
+        r, units = snapshot("locked", work / "locked")
+        check(r.returncode == 2 and "secret.txt" in r.stderr and "Traceback" not in r.stderr and not (work / "locked.json").exists(),
+              "B8: a file that cannot be read must exit 2 and name the path (exit %d): %s" % (r.returncode, r.stderr.strip()[-200:]))
+    put(work / "broken-snap.json", json.dumps({"units": {"skill:x": {}}}))
+    r, d = compare("broken-d", bdir, "broken-snap")
+    check(r.returncode == 2 and "Traceback" not in r.stderr, "B8: an internal error in diff must exit 2, never 1 (got %d)" % r.returncode)
+
+    # B9: the name a skill declares counts, not only its folder name.
+    put(work / "decl/session-start-hook/SKILL.md", skill_md % "startup-hook-skill")
+    snapshot("decl", work / "decl")
+    base("names", "--snapshot", work / "decl.json", "--out", work / "decl-names.txt")
+    check((work / "decl-names.txt").read_text("utf-8").split() == ["session-start-hook", "startup-hook-skill"],
+          "B9: names must list folder name and declared name: %s" % (work / "decl-names.txt").read_text("utf-8").split())
+
+    # B10: two unit IDs that map to one document ID must not share a file.
+    put(work / "docid/d1/.claude-plugin/plugin.json", '{"name": "a b"}')
+    put(work / "docid/d2/.claude-plugin/plugin.json", '{"name": "a_b"}')
+    snapshot("docid", work / "docid")
+    r = export("docid", work / "docid-base")
+    check(r.returncode == 0 and len(list((work / "docid-base").glob("*.json"))) == 2, "B10: export must write a document for each of two similar IDs")
+    r, d = compare("docid-d", work / "docid-base", "docid")
+    check(r.returncode == 0, "B10: a diff against the baseline just exported must exit 0 (got %d)" % r.returncode)
+
+    # B12: sync folders carry account IDs in their names. A renamed folder
+    # with untouched content is not a change.
+    home = work / "home"
+    synced = home / ".claude/plugins/synced"
+    put(synced / "aaa-acct1/p1/.claude-plugin/plugin.json", '{"name": "p1"}')
+    put(synced / "bbb-acct2/p2/.claude-plugin/plugin.json", '{"name": "p2"}')
+    put(synced / "aaa-acct1/notes.txt", "n1\n")
+    put(synced / "bbb-acct2/notes.txt", "n2\n")
+    put(synced / "bbb-acct2/other.txt", "o\n")
+    put(synced / ".bucket-aaa-acct1")
+
+    def auto(name):
+        # --auto looks below the home folder; point it at the fixture.
+        return subprocess.run([sys.executable, "-I", str(BASELINE), "snapshot", "--auto", "--out", str(work / (name + ".json"))],
+                              cwd=str(work), env=dict(os.environ, HOME=str(home)), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, timeout=120)
+
+    r = auto("lab1")
+    check(r.returncode == 0, "B12: snapshot --auto failed: %s" % r.stderr.strip()[-200:])
+    export("lab1", work / "lab-base")
+    (synced / "aaa-acct1").rename(synced / "zzz-acct1")
+    (synced / ".bucket-aaa-acct1").rename(synced / ".bucket-zzz-acct1")
+    auto("lab2")
+    r, d = compare("lab-d", work / "lab-base", "lab2")
+    check(d.get("changed") == [] and d.get("new") == [] and d.get("removed") == [],
+          "B12: a renamed sync folder must not be reported: changed %s, removed %s" % ([c["id"] for c in d.get("changed", [])], d.get("removed")))
 
 
 def main():
