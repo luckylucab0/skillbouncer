@@ -11,6 +11,7 @@ To cover a new rule: add a fixture to make_fixtures.py or
 make_evasion_fixtures.py and the rule ID to the tables below.
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,7 @@ EXPECTED_EVASION = {
     "ev-foldername": "FILENAME-INJECTION",                                           # E17
     "ev-fm-yaml": "FM-EXTRA-FIELD",                                                  # E18
     "pdf-helper": "FM-NAME-COLLISION",                                               # E18
+    "ev-media": "FS-DISGUISED-TEXT FS-UNKNOWN-BIN SHELL-PIPE ARCHIVE-POLYGLOT",      # E19
 }
 # Skills that must stay below MEDIUM.
 BENIGN = ["benign-api", "ev-benign", "ev-benign-meta"]
@@ -221,6 +223,12 @@ def test_hardening(work):
     r, rep, _ = scan(work, ev / "ev-wrapped", "wrapped")
     check(all(f["severity"] != "LOW" for f in rep["findings"] if f["rule"] == "MD-HIDDEN-COMMENT"), "MD-HIDDEN-COMMENT must be at least MEDIUM")
 
+    # E19: every one of the files must carry the hit, not only the skill.
+    r, rep, _ = scan(work, ev / "ev-media", "media")
+    piped = {f["file"] for f in rep["findings"] if f["rule"] == "SHELL-PIPE"}
+    for rel in ("assets/logo.gif", "assets/real.png", "assets/photo.jpg", "scripts/helper", "vendor/tools.zip", "vendor/more.zip"):
+        check(rel in piped, "ev-media/%s: the script lines inside were not found" % rel)
+
     # A lone SKILL.md gets the frontmatter checks.
     r, rep, _ = scan(work, ev / "pdf" / "SKILL.md", "lone")
     check(r.returncode != 0 and "FM-DESC-HIJACK" in rules(rep), "a lone SKILL.md as target skipped the frontmatter checks")
@@ -288,7 +296,6 @@ def test_hardening(work):
     check("FM-NAME-COLLISION" in rules(rep), "--known-names with a byte order mark missed the first name")
 
     # A folder that cannot be listed (not testable as root, who may list anything).
-    import os
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         put("locked/tables/SKILL.md", fm % "tables")
         put("locked/tables/scripts/lib/run.sh", shell)
@@ -296,6 +303,17 @@ def test_hardening(work):
         r, rep, _ = scan(work, hw / "locked", "locked")
         (hw / "locked/tables/scripts/lib").chmod(0o755)
         check(r.returncode == 2 and rules(rep).get("IO-ERROR") == "HIGH", "a folder that cannot be listed must be IO-ERROR HIGH")
+
+    # A pipe where a file is expected must not block the scan.
+    if hasattr(os, "mkfifo"):
+        put("pipe/tool/SKILL.md", fm % "tool")
+        (hw / "pipe/tool/.claude-plugin").mkdir()
+        os.mkfifo(str(hw / "pipe/tool/.claude-plugin/plugin.json"))
+        try:
+            r, rep, _ = scan(work, hw / "pipe", "pipe")
+            check(r.returncode == 2 and rules(rep).get("IO-ERROR") == "HIGH", "a pipe named plugin.json must be IO-ERROR HIGH")
+        except subprocess.TimeoutExpired:
+            check(False, "a pipe named plugin.json blocked the scan")
 
     # Inputs that stalled the scan for half a minute or more. Each is a few
     # hundred KB; the limit leaves room for a slow CI runner.
@@ -308,6 +326,11 @@ def test_hardening(work):
         "curl.md": "curl " * 20000 + "\n",
         "http.md": "http://" * 60000 + "\n",
         "comments.md": "<!---->\n" * 125000,
+        "entities.md": "&#10;" * 50000 + "\n",
+        "ncat.md": "ncat " * 50000 + "\n",
+        "cat.md": "cat " * 60000 + "\n",
+        "socat.md": "socat " * 40000 + "\n",
+        "dd.md": "dd if=" * 40000 + "\n",
         "keys/SKILL.md": "---\nname: keys\ndescription: d\n" + "".join("k%07d: v\n" % i for i in range(60000)) + "---\n",
         "cont/SKILL.md": "---\nname: cont\ndescription: d\n" + " a\n" * 400000 + "---\n",
     }
@@ -325,7 +348,6 @@ def test_hardening(work):
 
 
 def test_baseline(work):
-    import os  # only the baseline checks build symlinks and odd file names
 
     skill_md = "---\nname: %s\ndescription: d\n---\n"
 

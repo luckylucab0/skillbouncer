@@ -37,8 +37,11 @@ The finished 1.2.0 code was reviewed once more by independent reviewers, and
 every reported finding was reproduced by a second one before it counted.
 All 44 held: 24 in the scanner, 12 in the baseline script, 8 in the
 documentation. Most scanner gaps were already in 1.1.1. They are closed in
-1.2.0; the scanner cases are fixtures E13 to E18 and the checks in
+1.2.0; the scanner cases are fixtures E13 to E19 and the checks in
 `test_hardening`, the baseline cases are checks in `test_baseline`.
+
+The fixes were then checked by reviewers who had not written them. Six
+of them left a way around and were redone (S21).
 
 | # | Finding | Severity | Closed by |
 |---|---------|----------|-----------|
@@ -62,6 +65,7 @@ documentation. Most scanner gaps were already in 1.1.1. They are closed in
 | S18 | Deeply nested JSON, file names that are not UTF-8 and wrong types in `manifest.json` ended the run in a traceback with exit code 1, which reads as "changes to review". A line break in a plugin name wrote a forged line into the summary. | medium | Hostile input is hashed and the run goes on; any internal error exits 2; names are printed on one line. |
 | S19 | `names` listed folder names only, so a skill registered under another `name` in its frontmatter was missing from `--known-names`. Finding the unit of each file was quadratic and took minutes on large installs. | medium | Declared names are listed; one walk per root. |
 | S20 | The procedure texts could not be followed in places: the rescan after a scanner update never came to an end once a unit was removed or left PENDING, step 8 of the install review could not be done for an archive and recorded other hashes than the installed package for a clone, a failed run had no value in the `runs` format, and the two procedure files disagreed on a missing plugin folder. | medium | `diff` looks only at unchanged units for the rescan and lists PENDING ones; SKILL.md and `monthly-run.md` name the extraction command, the `ACCEPTED` and `FAILED` values and one answer for the missing folder. |
+| S21 | Found when the fixes were checked: a media signature was taken as proof (`GIF89a=1` is a shell assignment, and a real PNG header followed by script lines runs with `sh`); one NUL byte in a file with a media extension, or many in a file without extension, still ended in "not scanned"; the script part of an archive was looked for by its first two bytes; a run of encoded line breaks and four older rules were still quadratic; a pipe named `plugin.json` blocked the scan. | high | Binary files get the rules over their readable text. The script part of an archive is measured from the archive structure. Bounded quantifiers, and decoded entities are checked per line. Pipes are never opened. Fixture E19. |
 
 ## What the review did not solve
 

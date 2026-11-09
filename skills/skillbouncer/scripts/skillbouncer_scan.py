@@ -430,7 +430,7 @@ RULES = [
     ("SECRET-ENV-DUMP", "MEDIUM", "Reads all environment variables at once (instead of one named variable)",
      re.compile(r"(os\.environ\.(items|keys|values)\(\)|json\.dumps\(\s*(dict\()?\s*os\.environ|str\(\s*os\.environ\s*\)|for\s+\w+(\s*,\s*\w+)?\s+in\s+os\.environ\b|JSON\.stringify\(\s*process\.env\b|Object\.(keys|entries|values)\(\s*process\.env\s*\)|GetEnvironmentVariables\(\))", I), True),
     ("SECRET-ENV", "MEDIUM", "Reads environment variables/.env",
-     re.compile(r"(\bprintenv\b|\benv\s*\||\bcat\s+[^\n]*\.env\b|\bread (the )?\.env\b|\bset\s*>|Get-ChildItem\s+env:)", I), False),
+     re.compile(r"(\bprintenv\b|\benv\s*\||\bcat\s+[^\n]{0,300}\.env\b|\bread (the )?\.env\b|\bset\s*>|Get-ChildItem\s+env:)", I), False),
     ("SECRET-ASK", "LOW", "Asks for a password/API key/token",
      re.compile(r"\b(ask|prompt|request)\b.{0,30}\b(the user|them|user)\b.{0,30}\b(password|passphrase|api[ _-]?key|access token|secret key|private key|seed phrase|2fa|otp)\b", I), False),
 
@@ -438,9 +438,9 @@ RULES = [
     ("SHELL-PIPE", "HIGH", "Runs a download directly in a shell",
      re.compile(r"(curl|wget|iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b[^\n|]{0,300}\|\s*(sudo\s+)?((ba|z|da)?sh|iex|python3?|node|perl|ruby)\b|\biex\s*\(|Invoke-Expression|powershell[^\n]{0,300}-e(nc|ncodedcommand)?\s+[A-Za-z0-9+/=]{20,}|base64\s+(-d|--decode)[^\n]{0,300}\|\s*(ba)?sh|eval\s+\"?\$\((curl|wget)", I), False),
     ("SHELL-REVERSE", "HIGH", "Reverse shell / network backdoor",
-     re.compile(r"(/dev/tcp/|\bnc\s+(-[a-z]*e|-c)\b|\bncat\b.*-e|\bmkfifo\b|\bsocat\b.*exec|bash\s+-i\s+>&)", I), False),
+     re.compile(r"(/dev/tcp/|\bnc\s+(-[a-z]*e|-c)\b|\bncat\b.{0,300}-e|\bmkfifo\b|\bsocat\b.{0,300}exec|bash\s+-i\s+>&)", I), False),
     ("SHELL-DESTRUCT", "HIGH", "Destructive command",
-     re.compile(r"(\brm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME|\*)(\s|$)|\bmkfs\.|\bdd\s+if=.*of=/dev/|:\(\)\s*\{\s*:\|:&\s*\};:|\bchmod\s+-R\s+777\s+/)", I), False),
+     re.compile(r"(\brm\s+-[a-z]*r[a-z]*f?\s+(/|~|\$HOME|\*)(\s|$)|\bmkfs\.|\bdd\s+if=.{0,300}of=/dev/|:\(\)\s*\{\s*:\|:&\s*\};:|\bchmod\s+-R\s+777\s+/)", I), False),
     ("SHELL-PERSIST", "HIGH", "Persistence (autostart, cron, shell profiles)",
      re.compile(r"(\bcrontab\b|\blaunchctl\s+load\b|systemctl\s+enable\b|>>\s*~?/?\.?(bash|zsh)rc\b|>>\s*~/\.profile|\bschtasks\b|HKCU\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run)", I), False),
     ("SHELL-SUDO", "MEDIUM", "Elevated privileges (sudo/runas)",
@@ -1249,6 +1249,9 @@ def utf16_guess(data):
 def read_text_file(path):
     """Text of a small file the scanner parses itself (SKILL.md), decoded
     like scan_file does."""
+    if not os.path.isfile(path):
+        # Opening a pipe would block for good. scan_file reports the file.
+        raise OSError("not a regular file")
     with open(path, "rb") as fh:
         data = fh.read(MAX_TEXT_BYTES)
     codec = utf16_guess(data) if b"\x00" in data else None
@@ -1256,12 +1259,89 @@ def read_text_file(path):
     return normalise_newlines(text[1:] if text.startswith("\ufeff") else text)
 
 
+def apply_rules(lines_list, low, fpath, rel, skill, findings, is_code, note="", numbered=True):
+    """The line-based rules. Prefilter (see prefilter_rx): search the whole
+    lower-cased file first and only on a hit check line by line with the
+    exact rule. On large data files that saves most of the runtime."""
+    for rid, sev, desc, rx, code_only in RULES:
+        if code_only and not is_code:
+            continue
+        gate = RULE_FILE_GATE.get(rid)
+        if gate and not gate(fpath):
+            continue
+        if not RULES_PREFILTER[rid].search(low):
+            continue
+        hit = 0
+        for ln, line in enumerate(lines_list, 1):
+            if rx.search(line):
+                hit += 1
+                if numbered:
+                    findings.append((skill, sev, rid, desc + note, rel, ln, visible_snippet(line)))
+                elif hit == 1:
+                    first_hit = visible_snippet(line)
+        if hit:
+            if not numbered:
+                # Without line numbers every further hit would be the same
+                # entry again; one with the count says as much.
+                findings.append((skill, sev, rid, desc + note + (", %d places" % hit if hit > 1 else ""), rel, 0, first_hit))
+            continue
+        # The prefilter saw the pattern across a line break. JSON may break
+        # between key and value, Markdown puts the target of a reference
+        # definition on the next line, prose is wrapped. Only tried when no
+        # single line matched, so it adds nothing to a file that already
+        # carries the rule.
+        for i in range(len(lines_list) - 1):
+            first, second = lines_list[i], lines_list[i + 1]
+            if not first.strip() or not second.strip():
+                continue
+            joined = first.rstrip() + " " + second.lstrip()
+            if rx.search(joined):
+                findings.append((skill, sev, rid, desc + note + " (wrapped over two lines)", rel, i + 1 if numbered else 0, visible_snippet(joined)))
+
+
+# Eight or more characters a reader would see. Tab counts, other control
+# characters and undecodable bytes end a run. Shorter runs are chance: a
+# font holds the table tag "CFF " followed by an "I", which is no "cffi".
+READABLE_RUN = re.compile(r"[^\x00-\x08\x0a-\x1f\x7f\ufffd]{8,}")
+
+
+def looks_binary(data):
+    """True for content that is not plain text: a NUL byte or bytes that
+    are not UTF-8 in the first 8 KB. Later bytes do not count; a text file
+    with a binary tail is still read as text."""
+    head = data[:8192]
+    if b"\x00" in head:
+        return True
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError as e:
+        # A character cut in half by the 8 KB limit is not binary.
+        return e.start < len(head) - 4
+    return False
+
+
+def scan_readable(data, size, fpath, rel, skill, findings):
+    """Rules over the readable text inside a binary file. A shell skips NUL
+    bytes and runs every line it can read, whatever the first bytes are, so
+    a picture or font with script lines in it works as a script. The file
+    is not in the script inventory; a hit says where to look."""
+    text = normalise_newlines(data.replace(b"\x00", b"").decode("utf-8", "replace"))
+    lines_list = READABLE_RUN.findall(text)
+    apply_rules(lines_list, fold_for_prefilter("\n".join(lines_list)), fpath, rel, skill, findings, True,
+                " (readable text inside a binary file)", False)
+    if size > len(data):
+        findings.append((skill, "MEDIUM", "FS-TRUNCATED",
+                         "Binary file has %d KB, only the first %d KB were searched for readable text" % (size // 1024, len(data) // 1024),
+                         rel, 0, ""))
+
+
 # ---------------------------------------------------------------------------
 # Core: scan one file
 # ---------------------------------------------------------------------------
-def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
-    """lead=True scans what sits in front of the ZIP content of an archive
-    (see ARCHIVE-POLYGLOT) and skips the checks that go by extension."""
+def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=0):
+    """lead > 0 scans only that many bytes: what sits in front of the ZIP
+    content of an archive (see ARCHIVE-POLYGLOT). The checks that go by
+    extension are skipped for it."""
     ext = fpath.suffix.lower()
 
     # Symlinks can point at ~/.ssh or similar and smuggle real secrets in
@@ -1291,8 +1371,7 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
     with open(fpath, "rb") as fh:
         data = fh.read(MAX_TEXT_BYTES)
     if lead:
-        cut = data.find(b"PK\x03\x04")
-        data = data[:cut] if cut >= 0 else data
+        data = data[:lead]
     elif ext in BENIGN_BINARY_EXT:
         # The extension alone is not enough: a "logo.png" that is really an
         # ELF or PE program is a classic disguise.
@@ -1301,14 +1380,19 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
             findings.append((skill, "HIGH" if kind[0] == "EXEC" else "MEDIUM", "FS-DISGUISED-BIN",
                              "File with extension '%s' is in fact: %s" % (ext, kind[1]), rel, 0, ""))
             return
-        if data.startswith(MEDIA_MAGIC) or data[4:8] == b"ftyp" or not data.strip():
+        if not data.strip():
             return
-        # Neither a program nor the media type the name promises. A shell
-        # script called logo.png runs just as well with "sh logo.png", so
-        # text is scanned as text.
-        if b"\x00" in data:
-            findings.append((skill, "MEDIUM", "FS-UNKNOWN-BIN", "Binary file that is not what its extension '%s' says: not scanned" % ext, rel, 0, ""))
+        if looks_binary(data):
+            # A signature is no proof of a picture: "sh logo.png" runs the
+            # lines of a file that starts like a PNG, and "GIF89a=1" is a
+            # shell assignment. So the readable part is scanned in any case.
+            if not (data.startswith(MEDIA_MAGIC) or data[4:8] == b"ftyp"):
+                findings.append((skill, "MEDIUM", "FS-UNKNOWN-BIN",
+                                 "Binary file that is not what its extension '%s' says: only its readable text was scanned" % ext, rel, 0, ""))
+            scan_readable(data, st.st_size, fpath, rel, skill, findings)
             return
+        # Plain text under a media name. A shell script called logo.png
+        # runs just as well, so it is scanned as text.
         findings.append((skill, "MEDIUM", "FS-DISGUISED-TEXT", "File with media extension '%s' is text: scanned as text" % ext, rel, 0, ""))
 
     codec = None
@@ -1324,7 +1408,8 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
                 # file that claims to be code or text is HIGH.
                 claims_text = is_code_path(fpath) or data.startswith(b"#!") or ext in TEXT_EXT
                 findings.append((skill, "HIGH" if claims_text else "MEDIUM", "FS-UNKNOWN-BIN",
-                                 "Binary file with text extension '%s': not scanned" % ext, rel, 0, ""))
+                                 "Binary file with text extension '%s': only its readable text was scanned" % ext, rel, 0, ""))
+                scan_readable(data, st.st_size, fpath, rel, skill, findings)
                 return
             # A few NUL bytes do not stop a shell or a model from reading
             # the rest, so they must not stop the scanner either.
@@ -1340,7 +1425,7 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
     text = normalise_newlines(text)
     if codec:
         findings.append((skill, "LOW", "FS-ENCODING", "UTF-16 text: decoded for the scan, shown as garbage by tools that expect UTF-8", rel, 0, ""))
-    if st.st_size > MAX_TEXT_BYTES and not lead:
+    if min(lead or st.st_size, st.st_size) > MAX_TEXT_BYTES:
         findings.append((skill, "HIGH", "FS-TRUNCATED",
                          "File has %d KB, only the first %d KB were scanned: read the rest by hand" % (st.st_size // 1024, MAX_TEXT_BYTES // 1024),
                          rel, 0, ""))
@@ -1349,7 +1434,7 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
     # Code is not only recognised by its extension: a "helper" without one
     # but with "#!/bin/bash" on the first line is just as executable.
     has_shebang = text.startswith("#!")
-    is_code = is_code_path(fpath) or has_shebang or lead
+    is_code = is_code_path(fpath) or has_shebang or bool(lead)
     if has_shebang and not is_code_path(fpath):
         if ext in ("", ".bin"):
             findings.append((skill, "LOW", "FS-SHEBANG", "Script without an extension (shebang: %s)" % visible_snippet(text.splitlines()[0], 60), rel, 1, ""))
@@ -1375,39 +1460,10 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
             detail += " | decoded tag text: " + visible_snippet(hidden, 200)
         findings.append((skill, "HIGH", "UNICODE-INVISIBLE", detail, rel, lines[0], ""))
 
+    # 2) Line-based rules.
     lines_list = text.splitlines()
-
-    # 2) Line-based rules. Prefilter (see prefilter_rx): search the whole
-    #    lower-cased file first and only on a hit check line by line with
-    #    the exact rule. On large data files that saves most of the runtime.
     low = fold_for_prefilter(text)
-    for rid, sev, desc, rx, code_only in RULES:
-        if code_only and not is_code:
-            continue
-        gate = RULE_FILE_GATE.get(rid)
-        if gate and not gate(fpath):
-            continue
-        if not RULES_PREFILTER[rid].search(low):
-            continue
-        hit = False
-        for ln, line in enumerate(lines_list, 1):
-            if rx.search(line):
-                hit = True
-                findings.append((skill, sev, rid, desc, rel, ln, visible_snippet(line)))
-        if hit:
-            continue
-        # The prefilter saw the pattern across a line break. JSON may break
-        # between key and value, Markdown puts the target of a reference
-        # definition on the next line, prose is wrapped. Only tried when no
-        # single line matched, so it adds nothing to a file that already
-        # carries the rule.
-        for i in range(len(lines_list) - 1):
-            first, second = lines_list[i], lines_list[i + 1]
-            if not first.strip() or not second.strip():
-                continue
-            joined = first.rstrip() + " " + second.lstrip()
-            if rx.search(joined):
-                findings.append((skill, sev, rid, desc + " (wrapped over two lines)", rel, i + 1, visible_snippet(joined)))
+    apply_rules(lines_list, low, fpath, rel, skill, findings, is_code)
     for ln, line in enumerate(lines_list, 1):
         mixed = mixed_script_words(line)
         if mixed:
@@ -1443,7 +1499,11 @@ def scan_file(fpath, rel, skill, findings, domains, scripts_inv, lead=False):
         for m in HTML_ENTITIES_RE.finditer(text):
             decoded = html.unescape(m.group(0))
             ln = lines_index.at(m.start())
-            hits = injection_hits(decoded)
+            # Checked as one line and per line. As a block, a run of encoded
+            # line breaks turns the rules anchored at the line start
+            # quadratic.
+            parts = [re.sub(r"\s+", " ", decoded)] + [part for part in decoded.splitlines() if part.strip()]
+            hits = sorted({h for part in parts for h in injection_hits(part)})
             findings.append((skill, "HIGH" if hits else "MEDIUM", "HTML-ENTITIES",
                              "Text spelled in HTML entities%s, decoded" % (" (matches %s)" % ", ".join(hits) if hits else ""),
                              rel, ln, visible_snippet(decoded, 160)))
@@ -1615,12 +1675,17 @@ def package_combos(scripts_inv, group_of, findings):
     return union_caps
 
 
-def zip_has_lead(path):
-    """True when the file does not start with ZIP data. zipfile only looks
-    for the directory at the end, so a shell script with a small archive
-    appended is a valid ZIP and a runnable script at once."""
-    with open(path, "rb") as fh:
-        return fh.read(2) != b"PK"
+def zip_lead_size(path):
+    """Number of bytes in front of the ZIP content, 0 for a plain archive.
+    zipfile only looks for the directory at the end, so a shell script with
+    a small archive appended is a valid ZIP and a runnable script at once.
+    The size comes from the archive structure: the first bytes prove
+    nothing, "PK=1" is an ordinary shell assignment."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return min([i.header_offset for i in zf.infolist()] + [zf.start_dir])
+    except Exception:  # noqa: BLE001 - extraction reports a broken archive
+        return 0
 
 
 def walk_tree(base, findings):
@@ -1685,8 +1750,9 @@ def scan_paths(paths, known_names=frozenset()):
             if not zipfile.is_zipfile(p):
                 findings.append(("(archive)", "HIGH", "ARCHIVE-ERROR", "File has an archive extension but is not a readable ZIP: content not scanned", p.name, 0, ""))
                 continue
-            if zip_has_lead(p):
-                lead_files.append((p, p.name, "(archive)"))
+            lead = zip_lead_size(p)
+            if lead:
+                lead_files.append((p, p.name, "(archive)", lead))
             targets.append((extract(p, p.name), 0, "", p.name))
         elif p.is_file() and ext in NESTED_ARCHIVE_EXT:
             # As a nested file this is MEDIUM; as the target it means that
@@ -1698,7 +1764,7 @@ def scan_paths(paths, known_names=frozenset()):
         else:
             targets.append((p, 0, "", p.name))
 
-    def scan_entry(f, rel, skill, name_text=None, lead=False):
+    def scan_entry(f, rel, skill, name_text=None, lead=0):
         # File names reach the model like content (directory listings,
         # "read references/<name>"), so they get the injection rules too.
         name_hits = injection_hits(re.sub(r"[_\-]+", " ", rel if name_text is None else name_text))
@@ -1818,8 +1884,9 @@ def scan_paths(paths, known_names=frozenset()):
                 inner_label = prefix + below_base(fs)
                 targets.append((extract(f, inner_label), depth + 1, inner_label, inner_label))
                 findings.append(("(archive)", "INFO", "ARCHIVE-SCANNED", "Nested archive extracted and scanned", inner_label, 0, ""))
-                if zip_has_lead(fs):
-                    lead_files.append((f, rel, skill))
+                lead = zip_lead_size(fs)
+                if lead:
+                    lead_files.append((f, rel, skill, lead))
                 scanned += 1
                 continue
             scanned += 1
@@ -1857,10 +1924,10 @@ def scan_paths(paths, known_names=frozenset()):
             except Exception as e:  # noqa: BLE001
                 findings.append((skill, "HIGH", "SCAN-ERROR", "SKILL.md could not be checked (%s: %s)" % (type(e).__name__, e), "SKILL.md", 0, ""))
         scan_entry(f, f.name, skill)
-    for f, rel, skill in lead_files:
+    for f, rel, skill, lead in lead_files:
         findings.append((skill, "HIGH", "ARCHIVE-POLYGLOT",
                          "Archive with other data in front of the ZIP content: the file can be run as a script and opened as an archive", rel, 0, ""))
-        scan_entry(f, rel, skill, f.name, lead=True)
+        scan_entry(f, rel, skill, f.name, lead=lead)
     file_count = counts["files"]
     if file_count == 0 and not any(f[2] == "SCAN-EMPTY" for f in findings):
         findings.append(("(scanner)", "HIGH", "SCAN-EMPTY", "No file was scanned: an empty result is not a clean result", "", 0, ""))

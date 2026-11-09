@@ -161,8 +161,10 @@ nie in einem sauberen Bericht. Dasselbe gilt für Inhalt, den der Scanner
 nicht vollständig lesen konnte: eine Datei über 5 MB (`FS-TRUNCATED`), eine
 Binärdatei hinter einer Text- oder Code-Endung (`FS-UNKNOWN-BIN`), ein
 Archiveintrag, der sich nicht entpacken lässt, ein Ordner, der sich nicht
-auflisten lässt (`IO-ERROR`). Auch Aufruffehler und interne Fehler enden
-mit 2. Die Ausschnitte im Bericht sind Zitate aus dem geprüften, nicht
+auflisten lässt (`IO-ERROR`). Bilder, Schriften und andere Binärdateien
+werden nach lesbarem Text durchsucht, und die Regeln laufen über diesen
+Text: Eine Shell führt Skriptzeilen in einer Datei aus, egal was deren
+erste Bytes sagen. Auch Aufruffehler und interne Fehler enden mit 2. Die Ausschnitte im Bericht sind Zitate aus dem geprüften, nicht
 vertrauenswürdigen Inhalt. Prüft skillbouncer sich selbst, meldet es seine
 eigenen Suchmuster und seine Dokumentation als HIGH. Das ist erwartet.
 

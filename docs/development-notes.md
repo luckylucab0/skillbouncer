@@ -85,10 +85,22 @@ Check a change against it before touching the rules.
   is a HIGH finding, and usage errors exit with 2, the code of a HIGH
   finding. A gate that only looks at the exit code stays closed.
 - Nothing is skipped by name or extension. Files under `.git` are scanned.
-  A file with a media extension is skipped only when it starts with a media
-  signature; otherwise it is read as text (`FS-DISGUISED-TEXT`). An archive
-  that does not start with ZIP data is also scanned as a script
-  (`ARCHIVE-POLYGLOT`).
+  A file with a media extension that is plain text is read as text
+  (`FS-DISGUISED-TEXT`).
+- The first bytes of a file prove nothing. `GIF89a=1` and `PK=1` are shell
+  assignments, and `sh logo.png` runs the readable lines of a file that
+  starts like a real PNG, because a shell drops NUL bytes and carries on
+  after a line it cannot run. Binary files therefore get the rules over
+  their readable text (runs of eight or more characters, NUL bytes removed),
+  one finding per rule and file. Runs shorter than eight are chance: the
+  font table tag `CFF ` followed by an `I` matched `cffi`.
+- The script part of an archive is measured from the archive structure
+  (offset of the first entry), not searched by signature. A `PK\x03\x04`
+  in a comment on line 1 cut the scanned part down to that one character.
+  It is still reported as `ARCHIVE-POLYGLOT`.
+- A pipe must never be opened: the scan blocks for good. This holds for the
+  small files the scanner parses itself (`plugin.json`, `SKILL.md`) as much
+  as for the files it scans.
 - Text is decoded before the rules run: a byte order mark is removed, UTF-16
   is decoded, a few NUL bytes are dropped. A file that is mostly NUL under a
   text or code extension is HIGH, because it was not read.

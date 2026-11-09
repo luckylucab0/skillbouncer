@@ -146,7 +146,9 @@ exist, a broken archive or an empty folder ends in a HIGH finding
 clean report. The same holds for content the scanner could not read in
 full: a file over 5 MB (`FS-TRUNCATED`), a binary under a text or code
 extension (`FS-UNKNOWN-BIN`), an archive entry that cannot be extracted, a
-folder that cannot be listed (`IO-ERROR`). Usage errors and internal errors
+folder that cannot be listed (`IO-ERROR`). Pictures, fonts and other binary
+files are searched for readable text, and the rules run over that text: a
+shell runs script lines inside a file whatever its first bytes say. Usage errors and internal errors
 exit with 2 as well. Snippets in the report
 are quotes from the scanned, untrusted content. When skillbouncer scans
 itself it reports its own search patterns and documentation as HIGH; that is

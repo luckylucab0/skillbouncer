@@ -136,6 +136,10 @@ w("ev-benign/.gitattributes", "* text=auto\n*.png binary\n")
 # A real-looking image, a file with a byte order mark and Windows line ends,
 # and frontmatter that names Claude products: all ordinary.
 w("ev-benign/assets/pixel.png", b"\x89PNG\r\n\x1a\n" + bytes(40))
+# A font carries readable names and a licence URL between its binary tables.
+w("ev-benign/assets/plain.ttf", b"\x00\x01\x00\x00\x00\x0c\x00\x80" + bytes(24)
+  + b"Copyright 2020 The Example Project Authors\x00Licensed under the SIL Open Font License, Version 1.1\x00"
+  + b"https://fonts.example/licence\x00" + bytes(range(128, 256)) * 4)
 w("ev-benign/references/notes.md", b"\xef\xbb\xbf# Notes\r\n\r\nColumns are separated by commas.\r\n")
 w("ev-benign-meta/SKILL.md", """---
 name: ev-benign-meta
@@ -180,6 +184,17 @@ with zipfile.ZipFile(buf, "w") as z:
     z.writestr("readme.txt", "nothing here\n")
 skill("ev-polyglot")
 w("ev-polyglot/vendor/setup.zip", SHELL_LINES.encode() + buf.getvalue())
+
+# E19: script lines inside files that pass for binary. A shell skips NUL
+# bytes and runs every line it can read, whatever the first bytes are.
+skill("ev-media")
+PAYLOAD = SHELL_LINES.split("\n", 1)[1].encode()
+w("ev-media/assets/logo.gif", b"GIF89a=1\n" + PAYLOAD)
+w("ev-media/assets/real.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(13) + b"\n" + PAYLOAD + b"\x00\x00\x00\x00IEND\xaeB`\x82")
+w("ev-media/assets/photo.jpg", b"\xff\xd8\xff\xe0 \xfe\xfe\n" + PAYLOAD)
+w("ev-media/scripts/helper", b"# pad\n# " + bytes(200) + b"\n" + PAYLOAD)
+w("ev-media/vendor/tools.zip", b"PK=1\n" + PAYLOAD + b"exit 0\n" + buf.getvalue())
+w("ev-media/vendor/more.zip", b"#PK\x03\x04\n" + PAYLOAD + b"exit 0\n" + buf.getvalue())
 
 # E16: the split stealer of E1 with a SKILL.md dropped next to one half
 skill("ev-nested-split")
