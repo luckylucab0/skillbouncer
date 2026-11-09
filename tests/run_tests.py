@@ -410,8 +410,37 @@ def test_baseline(work):
         d.write_text(json.dumps(doc), "utf-8")
     r = base("diff", "--baseline-dir", bdir, "--snapshot", snap1, "--out", work / "d2.json")
     d2 = json.loads((work / "d2.json").read_text("utf-8"))
-    check(r.returncode == 1 and "full rescan recommended" in r.stdout, "version change must exit 1 with the rescan hint")
+    check(r.returncode == 1 and "scanner rules changed since baseline" in r.stdout, "version change must exit 1 with the rescan hint")
     check(d2["rescan_all"] is True and len(d2["rescan_units"]) == 2 and not d2["changed"], "diff.json must list every unit for the rescan")
+    check(d2["rescan_ids"] == ["plugin:demo", "skill:solo"], "diff.json must name the units to rescan: %s" % d2.get("rescan_ids"))
+
+    # The rescan has to come to an end. A changed unit is reviewed anyway,
+    # and the document of a unit that is gone or waits for the user keeps
+    # its old version; none of them may ask for a rescan on every run.
+    r = base("diff", "--baseline-dir", bdir, "--snapshot", snap2, "--out", work / "d2b.json")
+    d2b = json.loads((work / "d2b.json").read_text("utf-8"))
+    check(d2b["rescan_ids"] == ["skill:solo"] and [c["id"] for c in d2b["changed"]] == ["plugin:demo"],
+          "a changed unit must not be listed for the rescan as well: %s" % d2b.get("rescan_ids"))
+    conv = work / "converge"
+    base("export", "--snapshot", snap1, "--out-dir", conv / "baseline")
+    gone = json.loads(docs[0].read_text("utf-8"))
+    gone.update({"id": "skill:gone", "files": {"SKILL.md": "0" * 64}})
+    (conv / "baseline" / "skill_gone.json").write_text(json.dumps(gone), "utf-8")
+    r = base("diff", "--baseline-dir", conv, "--snapshot", snap1, "--out", work / "d2c.json")
+    d2c = json.loads((work / "d2c.json").read_text("utf-8"))
+    check(r.returncode == 1 and d2c["removed"] == ["skill:gone"] and d2c["rescan_all"] is False,
+          "the old document of a removed unit must not ask for a rescan")
+    (conv / "baseline" / "skill_gone.json").unlink()
+    # A unit the rescan left for the user: files untouched, verdict
+    # PENDING, version of the rules that looked at it.
+    pend = next(d for d in (conv / "baseline").glob("*.json") if json.loads(d.read_text("utf-8"))["id"] == "skill:solo")
+    doc = json.loads(pend.read_text("utf-8"))
+    doc["verdict"] = "PENDING"
+    pend.write_text(json.dumps(doc), "utf-8")
+    r = base("diff", "--baseline-dir", conv, "--snapshot", snap1, "--out", work / "d2d.json")
+    d2d = json.loads((work / "d2d.json").read_text("utf-8"))
+    check(r.returncode == 0 and d2d["pending"] == ["skill:solo"] and "PENDING  skill:solo" in r.stdout,
+          "a unit waiting for the user must be listed without asking for a new review (exit %d)" % r.returncode)
 
     r = base("diff", "--baseline-dir", work / "no-such-dir", "--snapshot", snap1, "--out", work / "d3.json")
     check(r.returncode == 2, "diff against a missing baseline folder must exit 2")

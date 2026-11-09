@@ -170,11 +170,11 @@ Das Baseline-Skript `skillbouncer_baseline.py` hat fünf Unterbefehle:
 
 | Unterbefehl | Zweck |
 |-------------|-------|
-| `snapshot --auto [--root DIR ...] --out snap.json` | Findet die Installationsorte dieser Sitzung und erfasst einen Hash pro Datei und Einheit. Statt `--auto` können Ordner direkt angegeben werden. Endet mit 2, wenn ein angegebener Ordner fehlt oder keine Einheit gefunden wird. |
-| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Schreibt pro Einheit ein Baseline-Dokument als JSON in einen Ordner. |
-| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Vergleicht einen Snapshot mit den Baseline-Dokumenten in einem Ordner. Endet mit 1, wenn etwas zu prüfen ist (neue oder geänderte Einheiten oder eine andere Scanner-Version), sonst mit 0. |
-| `names --snapshot snap.json --out names.txt` | Schreibt die Namen aller installierten Skills, einen pro Zeile, für `--known-names`. |
-| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Bildet die Hashes beider Skripte und der SKILL.md und vergleicht sie mit den erwarteten. Endet mit 2 bei einer Abweichung oder einem fehlenden Hash. `--print` zeigt die aktuellen Hashes. |
+| `snapshot --auto [--root DIR ...] --out snap.json` | Findet die Installationsorte dieser Sitzung und erfasst einen Hash pro Datei und Einheit. Statt `--auto` können Ordner direkt angegeben werden. Jede Datei zählt, auch `.git` und `__pycache__`; ein als Symlink installierter Skill oder ein solches Plugin wird am Ziel erfasst. Endet mit 2, wenn ein angegebener Ordner fehlt, kein Skill oder Plugin gefunden wird oder sich etwas nicht lesen lässt. |
+| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Schreibt pro Einheit ein Baseline-Dokument als JSON in einen Ordner. `--only` ohne ID ist ein Fehler. |
+| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Vergleicht einen Snapshot mit den Baseline-Dokumenten in einem Ordner. Endet mit 1, wenn etwas zu prüfen ist: neue, geänderte oder entfernte Einheiten, ein Symlink auf Inhalt ausserhalb des Snapshots oder unveränderte Einheiten, die zuletzt mit einer anderen Scanner-Version geprüft wurden. Sonst endet es mit 0, bei einem Fehler mit 2. Einheiten mit PENDING werden aufgelistet, ohne den Exit-Code zu ändern. |
+| `names --snapshot snap.json --out names.txt` | Schreibt die Namen aller installierten Skills, einen pro Zeile, für `--known-names`: Ordnernamen und die Namen, die die SKILL.md-Dateien angeben. |
+| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Bildet die Hashes beider Skripte und der SKILL.md und vergleicht sie mit den erwarteten. Endet mit 2 bei einer Abweichung, einem fehlenden Hash oder einem Hash für eine andere Datei. `--print` zeigt die aktuellen Hashes. |
 
 ## Die monatliche geplante Aufgabe einrichten
 

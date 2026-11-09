@@ -156,11 +156,11 @@ The baseline script `skillbouncer_baseline.py` has five subcommands:
 
 | Subcommand | Purpose |
 |------------|---------|
-| `snapshot --auto [--root DIR ...] --out snap.json` | Find the install locations of this session and record a hash per file and unit. Explicit folders can be given instead of `--auto`. Exits 2 when a given folder does not exist or no unit is found. |
-| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Write one baseline document per unit into a folder as JSON. |
-| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Compare a snapshot with the baseline documents in a folder. Exits 1 when something needs review (new or changed units, or a changed scanner version), 0 otherwise. |
-| `names --snapshot snap.json --out names.txt` | Write the names of all installed skills, one per line, for `--known-names`. |
-| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Hash both scripts and SKILL.md and compare them with the expected hashes. Exits 2 on a mismatch or a missing hash. `--print` shows the current hashes. |
+| `snapshot --auto [--root DIR ...] --out snap.json` | Find the install locations of this session and record a hash per file and unit. Explicit folders can be given instead of `--auto`. Every file counts, `.git` and `__pycache__` included; a skill or plugin installed as a symlink is recorded at its target. Exits 2 when a given folder does not exist, no skill or plugin is found or something cannot be read. |
+| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Write one baseline document per unit into a folder as JSON. `--only` without an ID is an error. |
+| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Compare a snapshot with the baseline documents in a folder. Exits 1 when something needs review: new, changed or removed units, a symlink to content the snapshot does not hold, or unchanged units last reviewed under another scanner version. Exits 0 otherwise and 2 on an error. Units marked PENDING are listed without changing the exit code. |
+| `names --snapshot snap.json --out names.txt` | Write the names of all installed skills, one per line, for `--known-names`: folder names and the names the SKILL.md files declare. |
+| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Hash both scripts and SKILL.md and compare them with the expected hashes. Exits 2 on a mismatch, a missing hash or a hash for any other file. `--print` shows the current hashes. |
 
 ## Setting up the monthly scheduled task
 

@@ -50,9 +50,11 @@ Subcommands
       summary and writes the absolute paths of everything to review into
       diff.json. Exit 1 = something to review: new or changed units, units
       of the baseline that are gone ("removed"), symlinks whose target the
-      snapshot does not cover ("uncovered_links"), or "the scanner rules
-      changed since the baseline was written". 0 = nothing. 2 = error,
-      there is no result.
+      snapshot does not cover ("uncovered_links"), or unchanged units that
+      were last reviewed under other scanner rules ("rescan_ids"; the list
+      empties once those units are exported again). 0 = nothing. 2 = error,
+      there is no result. Units whose document says PENDING are listed
+      ("pending") without changing the exit code.
   names --snapshot snap.json --out names.txt
       Writes the names of all installed skills, one per line, for the
       scanner's --known-names option: folder names and the names the
@@ -654,14 +656,28 @@ def diff(baseline, snap):
                 result["to_review"].append(link)
 
     # Units cleared under older rules were never looked at with the new
-    # ones; their hashes will not change on their own. A baseline document
-    # without tool_version predates 1.2.0 and counts as older.
+    # ones, and their hashes will not change on their own. Only unchanged
+    # units count: a new or changed unit is reviewed in this run anyway, and
+    # the document of a unit that is gone or waits for the user keeps its
+    # old version for good, which would ask for a rescan on every run. The
+    # version is looked up by content, so a unit that only moved is covered
+    # by the review of its content. A baseline document without
+    # tool_version predates 1.2.0 and counts as older.
     now = snap.get("tool_version")
-    old = sorted({str(b.get("tool_version") or "unknown") for b in baseline.values()} - {now})
+    reviewed_with = {}
+    for uid, b in baseline.items():
+        reviewed_with.setdefault(base_hash[uid], set()).add(str(b.get("tool_version") or "unknown"))
+    stale = [uid for uid in result["unchanged"] if now not in reviewed_with.get(cur_hash[uid], ())]
     result["tool_version"] = now
-    result["baseline_tool_versions"] = old
-    result["rescan_all"] = bool(old)
-    result["rescan_units"] = sorted(u["path"] for u in cur.values()) if old else []
+    result["baseline_tool_versions"] = sorted({v for uid in stale for v in reviewed_with.get(cur_hash[uid], ())})
+    result["rescan_all"] = bool(stale)
+    result["rescan_ids"] = sorted(stale)
+    result["rescan_units"] = sorted(cur[uid]["path"] for uid in stale)
+
+    # A unit left for the user to decide is not new work for this run, but
+    # it must not drop out of sight while it waits.
+    result["pending"] = sorted(uid for uid, b in baseline.items()
+                               if str(b.get("verdict") or "").upper() == "PENDING" and (uid in cur or base_hash[uid] in present))
     return result
 
 
@@ -861,9 +877,13 @@ def main():
         if r["uncovered_links"]:
             print("links: %d symlink(s) lead to content the snapshot does not hold; review the targets or add their folder "
                   "as a root" % len(r["uncovered_links"]))
+        for uid in r["pending"]:
+            print("  PENDING  %s" % shown(uid))
+        if r["pending"]:
+            print("pending: %d unit(s) still wait for the user's decision" % len(r["pending"]))
         if r["rescan_all"]:
-            print("scanner rules changed since baseline: full rescan recommended (baseline %s, now %s)" % (
-                shown(", ".join(r["baseline_tool_versions"])), shown(r["tool_version"])))
+            print("scanner rules changed since baseline: rescan %d unchanged unit(s) (reviewed with %s, now %s)" % (
+                len(r["rescan_ids"]), shown(", ".join(r["baseline_tool_versions"])), shown(r["tool_version"])))
         # Exit code 1 signals "there is something to review". Removed units
         # count: a location the snapshot no longer covers looks the same as
         # an uninstall, and only a person can tell which it is.

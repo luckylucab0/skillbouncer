@@ -104,8 +104,30 @@ Check a change against it before touching the rules.
   escape or a file name cannot be encoded and ended the report in a
   traceback.
 - The baseline script exits 2 wherever silence would read as "no changes":
-  a missing root, zero units, a missing baseline folder, a selfcheck without
-  expectations.
+  a missing root, no skill or plugin at all (stray files alone do not
+  count), a file or folder it cannot read, a missing baseline folder, a
+  selfcheck without expectations or with a hash it cannot check, `export
+  --only` without an ID. Any internal error exits 2 as well; exit code 1
+  is reserved for "changes to review".
+- `diff` exits 1 for removed units. A missing install location looks the
+  same as an uninstall, and only a person can tell which it is.
+- A skip list of names (`.git`, `__pycache__`, `.in_use`, `manifest.json`)
+  hid everything below such a name at any depth. The baseline hashes every
+  file. The few files Claude rewrites at runtime are left out only in the
+  one place where they belong and only while their content has the
+  expected shape (`runtime_marker`, `sync_sidecar`).
+- A symlink is an entry of its own and is never followed, which left a
+  skill installed as a symlink with nothing compared behind it. Such a
+  folder is recorded as a unit at its target; every other link to content
+  outside the snapshot is reported on each run (`uncovered_links`).
+- The rescan flag must come to an end. Built from every baseline document,
+  it stayed set for good once one unit was removed or left PENDING. It now
+  looks only at unchanged units and at the version their content was last
+  reviewed with.
+- Names, versions and paths from packages are printed on one line. A line
+  break in a plugin name wrote a forged line into the diff summary.
+- Looking up the owning unit per file was quadratic (4000 + 4000 files took
+  minutes). The tree is walked once per root.
 
 ## Environment
 
