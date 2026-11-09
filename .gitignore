@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+tests/fixtures-out/
+*.plugin
+.in_use/
+.DS_Store
