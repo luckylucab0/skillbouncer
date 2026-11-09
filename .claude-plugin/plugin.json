@@ -1,7 +1,7 @@
 {
-  "name": "skillcheck",
-  "description": "Sicherheitsprüfung für Skills und Plugins: Scan auf Prompt-Injection, Datenabfluss und Schadcode vor der Installation, Malware-Analyse enthaltener Skripte, Hooks und MCP-Server, dazu ein monatlicher Abgleich gegen den geprüften Referenzstand.",
-  "version": "1.1.1",
+  "name": "skillbouncer",
+  "description": "Security review for Claude skills and plugins: scans for prompt injection, data exfiltration and malicious code before installation, analyses bundled scripts, hooks and MCP servers for malware, and re-checks installed plugins monthly against a reviewed baseline.",
+  "version": "1.2.0",
   "author": {
     "name": "luckylucab0"
   },

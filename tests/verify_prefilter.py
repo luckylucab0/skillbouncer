@@ -1,4 +1,8 @@
-"""Prueft, dass der Vorfilter keinen Treffer der Zeilenpruefung verliert."""
+"""Proves that the lower-cased whole-file prefilter loses no per-line hit.
+
+Usage: python3 -I verify_prefilter.py <scanner.py> <folder> [<folder> ...]
+Prints "lost 0" and exits 0 when the prefilter is a superset; exits 1
+otherwise. Run it after every rule change."""
 import importlib.util, sys
 from pathlib import Path
 spec = importlib.util.spec_from_file_location("scan", sys.argv[1]); scan = importlib.util.module_from_spec(spec); spec.loader.exec_module(scan)
@@ -15,5 +19,6 @@ for base in sys.argv[2:]:
             pre = bool(scan.RULES_PREFILTER[rid].search(low))
             hits += line_hit
             if line_hit and not pre:
-                lost += 1; print("VERLOREN", rid, f)
-print("Dateien %d, Regeltreffer (Datei x Regel) %d, verloren %d" % (files, hits, lost))
+                lost += 1; print("LOST", rid, f)
+print("files %d, rule hits (file x rule) %d, lost %d" % (files, hits, lost))
+sys.exit(1 if lost else 0)
