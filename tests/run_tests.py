@@ -142,6 +142,10 @@ def test_scanner(work):
     check("Snippets are quotes from the scanned, untrusted content." in r2.stdout, "report lacks the untrusted-snippet notice")
     check(("scanner %s" % rep2["scanner_version"]) in r2.stdout.splitlines()[0], "report header lacks the scanner version")
 
+    # One version for the scanner and the plugin manifest.
+    manifest = json.loads((REPO / ".claude-plugin" / "plugin.json").read_text("utf-8"))
+    check(manifest.get("version") == rep2["scanner_version"], "plugin.json version %s differs from scanner VERSION %s" % (manifest.get("version"), rep2["scanner_version"]))
+
     # E8: many unclosed HTML comments must not stall the scanner.
     r, rep, t = scan(work, ev / "ev-slow", "slow")
     check(t < 2, "ev-slow took %.1f s (limit 2 s)" % t)
@@ -155,6 +159,17 @@ def test_scanner(work):
     check("FM-NAME-COLLISION" in rules_by_skill(rep).get("ev-benign", {}), "--known-names did not report the collision")
     r = run([SCAN, ev / "ev-benign", "--known-names", work / "missing.txt"], work)
     check(r.returncode not in (0, 1), "a missing --known-names file must be an error, not a clean scan")
+
+    # Targets that yield nothing must not look like a clean scan.
+    (work / "void").mkdir()
+    (work / "broken.plugin").write_text("not a zip", "utf-8")
+    for target, rid in ((work / "no-such-path", "SCAN-TARGET"), (work / "void", "SCAN-EMPTY"), (work / "broken.plugin", "ARCHIVE-ERROR")):
+        r, rep, _ = scan(work, target, "failclosed")
+        check(r.returncode == 2 and rep is not None and any(f["rule"] == rid for f in rep["findings"]),
+              "%s must end in %s and exit 2 (got %d)" % (target.name, rid, r.returncode))
+    # A single file as target is scanned, not skipped.
+    r, rep, _ = scan(work, ev / "ev-shortb64" / "scripts" / "d.py", "single")
+    check(rep is not None and any(f["rule"] == "OBF-BASE64-SHORT" for f in rep["findings"]), "a single file given as target was not scanned")
 
     # A plugin package is scanned as an archive, without unpacking it here.
     archive = shutil.make_archive(str(work / "pkg"), "zip", str(fx / "evil-plugin"))

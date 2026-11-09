@@ -134,6 +134,7 @@ CODE_EXT = {
     ".reg", ".desktop", ".url", ".service", ".timer", ".plist", ".csproj",
     ".targets", ".props", ".gradle", ".groovy", ".r", ".ahk", ".au3", ".nix",
     ".ex", ".exs", ".scala", ".kts", ".m", ".mm", ".vb", ".inf",
+    ".gitconfig",       # "team.gitconfig", pulled in through include.path
 }
 # Files without a (distinctive) extension that still run code, e.g. on
 # "make", "docker build" or "pip install" (setup.py runs then).
@@ -144,7 +145,8 @@ CODE_NAMES = {
     # CI system executes without being asked. Path(".envrc").suffix is "",
     # so dotfiles can only be matched by their full name.
     ".envrc", ".bashrc", ".zshrc", ".zshenv", ".zprofile", ".profile",
-    ".bash_profile", ".bash_login", ".gitconfig", ".gitattributes",
+    ".bash_profile", ".bash_login", ".gitconfig", "gitconfig", ".gitmodules",
+    ".gitattributes",
     ".pre-commit-config.yaml", "tasks.json", "launch.json",
     "devcontainer.json", "docker-compose.yml", "docker-compose.yaml",
     "compose.yml", "compose.yaml", "Vagrantfile", "Jenkinsfile",
@@ -163,7 +165,8 @@ def is_code_path(fpath):
 
 # git reads these as configuration. AUTORUN-GITCONFIG is limited to them:
 # "name = !value" is ordinary code in most languages.
-GIT_CONFIG_NAMES = {".gitconfig", "gitconfig", ".gitmodules", "config", ".gitattributes"}
+# Every name here is also in CODE_NAMES, otherwise the rule could not fire.
+GIT_CONFIG_NAMES = {".gitconfig", "gitconfig", ".gitmodules", ".gitattributes"}
 # Harmless binary formats (fonts, images, PDF templates). Other binaries
 # (exe, so, dll, jar, pyc ...) have no place in an instruction skill and
 # are rated high.
@@ -323,6 +326,10 @@ def mixed_script_words(line):
 #
 # The rules are deliberately broad. The goal is high recall; sorting out
 # false alarms happens in the triage step, in context.
+#
+# Keep quantifiers bounded: write [^\n]{0,200}, not [^\n]*. An unbounded
+# one turns quadratic on minified lines of a megabyte. After any change run
+# tests/verify_prefilter.py (see prefilter_rx below).
 I = re.IGNORECASE
 RULES = [
     # --- Prompt injection: attempts to override system/user instructions
@@ -697,7 +704,7 @@ FM_KNOWN_KEYS = {
     "name", "description", "license", "version", "author", "allowed-tools",
     "argument-hint", "model", "disable-model-invocation", "user-invocable",
     "compatibility", "metadata",
-    # Claude Code fields beyond the handoff list. "hooks" is left out on
+    # Further fields Claude Code documents. "hooks" is left out on
     # purpose: a skill that registers hooks should be reported.
     "when_to_use", "shell", "effort", "context", "agent", "paths",
 }
@@ -1373,8 +1380,20 @@ def scan_paths(paths, known_names=frozenset()):
     tmpdirs = []
     targets = []
 
+    single_files = []
     for p in paths:
         p = Path(p).resolve()
+        if not p.exists():
+            # Reported as a finding so that a mistyped path cannot end in an
+            # empty report with exit code 0.
+            findings.append(("(scanner)", "HIGH", "SCAN-TARGET", "Path does not exist: nothing was scanned for it", str(p), 0, ""))
+            continue
+        if p.is_file() and p.suffix.lower() in ZIP_BASED_EXT and not zipfile.is_zipfile(p):
+            findings.append(("(archive)", "HIGH", "ARCHIVE-ERROR", "File has an archive extension but is not a readable ZIP: content not scanned", p.name, 0, ""))
+            continue
+        if p.is_file() and p.suffix.lower() not in ZIP_BASED_EXT:
+            single_files.append(p)
+            continue
         if p.is_file() and p.suffix.lower() in ZIP_BASED_EXT and zipfile.is_zipfile(p):
             # Extract archives into their own empty temp folder so that foreign
             # files never end up next to our own scripts.
@@ -1387,6 +1406,20 @@ def scan_paths(paths, known_names=frozenset()):
             targets.append(td)
         else:
             targets.append(p)
+
+    def scan_entry(f, rel, skill):
+        # File names reach the model like content (directory listings,
+        # "read references/<name>"), so they get the injection rules too.
+        name_hits = injection_hits(re.sub(r"[_\-]+", " ", rel))
+        if name_hits:
+            findings.append((skill, "MEDIUM", "FILENAME-INJECTION", "File name reads like an instruction (matches %s)" % ", ".join(name_hits), rel, 0, visible_snippet(rel)))
+        try:
+            scan_file(f, rel, skill, findings, domains, scripts_inv)
+        except OSError as e:
+            # Unreadable means unreviewed, which is not LOW.
+            findings.append((skill, "HIGH", "IO-ERROR", "File could not be read (%s): not scanned" % e, rel, 0, ""))
+        except Exception as e:  # noqa: BLE001 - the scanner must never fail open
+            findings.append((skill, "HIGH", "SCAN-ERROR", "File crashed the scanner (%s: %s): check by hand" % (type(e).__name__, e), rel, 0, ""))
 
     # Per target: (folder, nesting depth, display name of the archive).
     targets = [(t, 0, "") for t in targets]
@@ -1455,17 +1488,13 @@ def scan_paths(paths, known_names=frozenset()):
             if label and root is None:
                 rel = label + "!/" + rel
             file_count += 1
-            # File names reach the model like content (directory listings,
-            # "read references/<name>"), so they get the injection rules too.
-            name_hits = injection_hits(re.sub(r"[_\-]+", " ", rel))
-            if name_hits:
-                findings.append((skill, "MEDIUM", "FILENAME-INJECTION", "File name reads like an instruction (matches %s)" % ", ".join(name_hits), rel, 0, visible_snippet(rel)))
-            try:
-                scan_file(f, rel, skill, findings, domains, scripts_inv)
-            except OSError as e:
-                findings.append((skill, "LOW", "IO-ERROR", str(e), rel, 0, ""))
-            except Exception as e:  # noqa: BLE001 - the scanner must never fail open
-                findings.append((skill, "HIGH", "SCAN-ERROR", "File crashed the scanner (%s: %s): check by hand" % (type(e).__name__, e), rel, 0, ""))
+            scan_entry(f, rel, skill)
+    # A single file given as a target (a lone script or SKILL.md).
+    for f in single_files:
+        file_count += 1
+        scan_entry(f, f.name, "(outside skill)")
+    if file_count == 0:
+        findings.append(("(scanner)", "HIGH", "SCAN-EMPTY", "No file was scanned: an empty result is not a clean result", "", 0, ""))
     try:
         union_caps = package_combos(scripts_inv, group_of, findings)
     except Exception as e:  # noqa: BLE001 - the scanner must never fail open
