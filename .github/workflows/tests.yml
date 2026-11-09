@@ -10,12 +10,17 @@ permissions:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Oldest supported version and the current one.
-        python-version: ["3.9", "3.13"]
+        # Oldest supported version and the current one. setup-python has no
+        # 3.9 build for images newer than 24.04, so that job pins its image.
+        include:
+          - python-version: "3.9"
+            os: ubuntu-24.04
+          - python-version: "3.13"
+            os: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
