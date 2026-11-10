@@ -48,7 +48,8 @@ To build the file from a checkout, run this in the repository root:
 ```bash
 zip -r skillbouncer-v1.2.0.plugin . \
     -x '.git/*' '.github/*' 'tests/*' 'docs/*' 'README.md' 'README.de.md' \
-       'CHANGELOG.md' 'CLAUDE.md' '.gitignore' '*__pycache__*' '*.plugin'
+       'CHANGELOG.md' 'CLAUDE.md' 'SECURITY.md' '.gitignore' '*__pycache__*' \
+       '*.plugin'
 ```
 
 The exclusions keep tests, repository metadata and development documents out
@@ -258,6 +259,9 @@ as a whole folder.
   sees only the places where it finds installed skills and plugins. Code a
   plugin downloads at runtime or an MCP server it starts from an unpinned
   package is outside the baseline.
+
+Found a way around the scanner or the baseline? `SECURITY.md` says how to
+report it privately.
 
 ## Development
 
