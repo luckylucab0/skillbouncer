@@ -641,11 +641,12 @@ def test_baseline(work):
     check(r.returncode == 1 and not any(l.startswith("unchanged: 9") for l in r.stdout.splitlines()),
           "B8: a plugin name must not be able to add lines to the diff summary: %r" % r.stdout)
     if hasattr(os, "geteuid") and os.geteuid() != 0:  # root reads everything
-        put(work / "locked/sk/SKILL.md", skill_md % "sk")
-        put(work / "locked/sk/secret.txt", "x\n")
-        os.chmod(str(work / "locked/sk/secret.txt"), 0)
-        r, units = snapshot("locked", work / "locked")
-        check(r.returncode == 2 and "secret.txt" in r.stderr and "Traceback" not in r.stderr and not (work / "locked.json").exists(),
+        # Names of its own: the scanner checks above leave a locked.json.
+        put(work / "unreadable/sk/SKILL.md", skill_md % "sk")
+        put(work / "unreadable/sk/secret.txt", "x\n")
+        os.chmod(str(work / "unreadable/sk/secret.txt"), 0)
+        r, units = snapshot("unreadable", work / "unreadable")
+        check(r.returncode == 2 and "secret.txt" in r.stderr and "Traceback" not in r.stderr and not (work / "unreadable.json").exists(),
               "B8: a file that cannot be read must exit 2 and name the path (exit %d): %s" % (r.returncode, r.stderr.strip()[-200:]))
     put(work / "broken-snap.json", json.dumps({"units": {"skill:x": {}}}))
     r, d = compare("broken-d", bdir, "broken-snap")
