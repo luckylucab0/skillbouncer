@@ -157,8 +157,14 @@ Optionen:
 Achte im Kopf des Berichts auf die Zahl bei «Files scanned». Ein Pfad, den
 es nicht gibt, ein defektes Archiv oder ein leerer Ordner endet in einem
 HIGH-Befund (`SCAN-TARGET`, `ARCHIVE-ERROR`, `SCAN-EMPTY`) und Exit-Code 2,
-nie in einem sauberen Bericht. Auch Aufruffehler enden mit 2. Die
-Ausschnitte im Bericht sind Zitate aus dem geprüften, nicht
+nie in einem sauberen Bericht. Dasselbe gilt für Inhalt, den der Scanner
+nicht vollständig lesen konnte: eine Datei über 5 MB (`FS-TRUNCATED`), eine
+Binärdatei hinter einer Text- oder Code-Endung (`FS-UNKNOWN-BIN`), ein
+Archiveintrag, der sich nicht entpacken lässt, ein Ordner, der sich nicht
+auflisten lässt (`IO-ERROR`). Bilder, Schriften und andere Binärdateien
+werden nach lesbarem Text durchsucht, und die Regeln laufen über diesen
+Text: Eine Shell führt Skriptzeilen in einer Datei aus, egal was deren
+erste Bytes sagen. Auch Aufruffehler und interne Fehler enden mit 2. Die Ausschnitte im Bericht sind Zitate aus dem geprüften, nicht
 vertrauenswürdigen Inhalt. Prüft skillbouncer sich selbst, meldet es seine
 eigenen Suchmuster und seine Dokumentation als HIGH. Das ist erwartet.
 
@@ -166,11 +172,11 @@ Das Baseline-Skript `skillbouncer_baseline.py` hat fünf Unterbefehle:
 
 | Unterbefehl | Zweck |
 |-------------|-------|
-| `snapshot --auto [--root DIR ...] --out snap.json` | Findet die Installationsorte dieser Sitzung und erfasst einen Hash pro Datei und Einheit. Statt `--auto` können Ordner direkt angegeben werden. Endet mit 2, wenn ein angegebener Ordner fehlt oder keine Einheit gefunden wird. |
-| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Schreibt pro Einheit ein Baseline-Dokument als JSON in einen Ordner. |
-| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Vergleicht einen Snapshot mit den Baseline-Dokumenten in einem Ordner. Endet mit 1, wenn etwas zu prüfen ist (neue oder geänderte Einheiten oder eine andere Scanner-Version), sonst mit 0. |
-| `names --snapshot snap.json --out names.txt` | Schreibt die Namen aller installierten Skills, einen pro Zeile, für `--known-names`. |
-| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Bildet die Hashes beider Skripte und der SKILL.md und vergleicht sie mit den erwarteten. Endet mit 2 bei einer Abweichung oder einem fehlenden Hash. `--print` zeigt die aktuellen Hashes. |
+| `snapshot --auto [--root DIR ...] --out snap.json` | Findet die Installationsorte dieser Sitzung und erfasst einen Hash pro Datei und Einheit. Statt `--auto` können Ordner direkt angegeben werden. Jede Datei zählt, auch `.git` und `__pycache__`; ein als Symlink installierter Skill oder ein solches Plugin wird am Ziel erfasst. Endet mit 2, wenn ein angegebener Ordner fehlt, kein Skill oder Plugin gefunden wird oder sich etwas nicht lesen lässt. |
+| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Schreibt pro Einheit ein Baseline-Dokument als JSON in einen Ordner. `--only` ohne ID ist ein Fehler. |
+| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Vergleicht einen Snapshot mit den Baseline-Dokumenten in einem Ordner. Endet mit 1, wenn etwas zu prüfen ist: neue, geänderte oder entfernte Einheiten, ein Symlink auf Inhalt ausserhalb des Snapshots oder unveränderte Einheiten, die zuletzt mit einer anderen Scanner-Version geprüft wurden. Sonst endet es mit 0, bei einem Fehler mit 2. Einheiten mit PENDING werden aufgelistet, ohne den Exit-Code zu ändern. |
+| `names --snapshot snap.json --out names.txt` | Schreibt die Namen aller installierten Skills, einen pro Zeile, für `--known-names`: Ordnernamen und die Namen, die die SKILL.md-Dateien angeben. |
+| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Bildet die Hashes beider Skripte und der SKILL.md und vergleicht sie mit den erwarteten. Endet mit 2 bei einer Abweichung, einem fehlenden Hash oder einem Hash für eine andere Datei. `--print` zeigt die aktuellen Hashes. |
 
 ## Die monatliche geplante Aufgabe einrichten
 
@@ -192,7 +198,7 @@ sha256sum skills/skillbouncer/scripts/*.py skills/skillbouncer/SKILL.md
 ```
 
 Wo `sha256sum` fehlt, liefert `shasum -a 256` dasselbe Format. Ein Auftrag
-kann so aussehen (der erste Satz darf auch deutsch sein):
+kann so aussehen:
 
 ```text
 Run the skillbouncer monthly check (mode B, references/monthly-run.md).
@@ -291,6 +297,8 @@ python3 -I tests/verify_prefilter.py skills/skillbouncer/scripts/skillbouncer_sc
 `tests/run_tests.py` baut beide Fixture-Sätze in einen temporären Ordner,
 lässt Scanner und Baseline-Skript darüber laufen und vergleicht die
 Ergebnisse mit den erwarteten Regel-IDs pro Fixture.
+Der Lauf dauert etwa eine halbe Minute. Den grössten Teil davon brauchen
+Eingaben, die den Scanner früher blockiert haben.
 `tests/verify_prefilter.py` belegt, dass der schnelle Vorfilter des Scanners
 über die ganze Datei keinen Zeilentreffer verliert. Die letzte Zeile muss
 auf `lost 0` enden. `tests/profile_rules.py <scanner.py> <folder>` zeigt,
@@ -311,7 +319,8 @@ Nullen. `tests/fixtures-out/` wird erzeugt und von git ignoriert.
    Umgehungstechnik nachbildet.
 3. Die Regel-ID bei den erwarteten IDs dieses Fixtures in
    `tests/run_tests.py` eintragen und prüfen, dass die harmlosen Fixtures
-   (`benign-api`, `ev-benign`) weiterhin keinen MEDIUM- oder HIGH-Befund
+   (`benign-api`, `ev-benign`, `ev-benign-meta`) weiterhin keinen MEDIUM-
+   oder HIGH-Befund
    haben.
 4. Die Tests und `verify_prefilter.py` ausführen.
 

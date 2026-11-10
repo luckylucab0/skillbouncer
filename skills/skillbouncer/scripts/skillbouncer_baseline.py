@@ -28,31 +28,58 @@ Units
   * loose:<root>   - the remaining files of a root (e.g. the .skill
                      archives next to the bundled skills), so that nothing
                      gets added there unnoticed either.
+Units that would get an ID already taken by a differing unit are tracked
+as <id>@<root>, <id>@<root>-2 and so on; none replaces another.
 
 Subcommands
 -----------
   snapshot (--auto [--root DIR ...] | ROOT [ROOT ...]) --out snap.json
       Records the current state. --auto discovers the install locations
       at runtime; they differ between Claude products and sessions. Exits
-      2 when a root given explicitly does not exist or when no unit at all
-      is found: an empty snapshot would read as "nothing changed" forever.
+      2 when a root given explicitly does not exist, when no skill or
+      plugin at all is found or when something cannot be read: an empty or
+      partial snapshot would read as "nothing changed" forever.
   export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]
       Writes one JSON document per unit into DIR. How those documents get
       into the user's baseline store (a database, a private repository) is
       not this script's business; it only ever sees JSON directories.
+      --only without an ID is an error, not "all units".
   diff --baseline-dir DIR --snapshot snap.json --out diff.json
       Compares. DIR holds the baseline documents as JSON, directly or in
       subfolders (DIR/baseline/<id>.json works too). Prints a readable
       summary and writes the absolute paths of everything to review into
-      diff.json. Exit 1 = something to review, including "the scanner
-      rules changed since the baseline was written"; 0 = nothing.
+      diff.json. Exit 1 = something to review: new or changed units, units
+      of the baseline that are gone ("removed"), symlinks whose target the
+      snapshot does not cover ("uncovered_links"), or unchanged units that
+      were last reviewed under other scanner rules ("rescan_ids"; the list
+      empties once those units are exported again). 0 = nothing. 2 = error,
+      there is no result. Units whose document says PENDING are listed
+      ("pending") without changing the exit code.
   names --snapshot snap.json --out names.txt
       Writes the names of all installed skills, one per line, for the
-      scanner's --known-names option.
+      scanner's --known-names option: folder names and the names the
+      SKILL.md files declare.
   selfcheck (--expect HASH:PATH[,HASH:PATH ...] | --expect-file FILE | --print)
       Hashes this script, the scanner and SKILL.md and compares them with
-      hashes kept outside the sandbox. Exit 2 on any mismatch or missing
-      expectation.
+      hashes kept outside the sandbox. Exit 2 on any mismatch, on a missing
+      expectation and on an expectation it cannot check (another file, two
+      hashes for one file).
+
+What is hashed
+--------------
+Every file below a root, hidden files and folders such as .git and
+__pycache__ included. Left out are only files Claude's own bookkeeping
+rewrites at runtime, each in the one place where it belongs and only while
+its content has the expected harmless shape (see runtime_marker and
+sync_sidecar). Anything else of that name is hashed like every other file.
+
+Symlinks are never followed: a link is an entry of its own (a hash of its
+target text), so a new or retargeted link is a change. Two additions keep a
+link from hiding content. A symlink to a skill or plugin folder outside the
+recorded folders is recorded as a unit, read at its target. Every other
+link whose target is not part of the snapshot is listed under
+"uncovered_links", and diff reports it on every run, because nothing
+compares what it points to. Add that folder as a root to cover it.
 
 node_modules
 ------------
@@ -71,27 +98,28 @@ Standard library only; run with "python3 -I" (see skillbouncer_scan.py).
 import argparse
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Folders/files that change at runtime without the skill changing. Hashing
-# them would raise a false alarm on every run. node_modules is deliberately
-# not in this list (see module docstring).
-IGNORE_NAMES = {".in_use", ".last-complete-round", ".git", "__pycache__", ".DS_Store"}
-
 # Characters allowed in document IDs of common document stores.
 DOC_ID_SAFE = re.compile(r"[^A-Za-z0-9_\-.~:@+]")
 
-HOME = Path.home()
+try:
+    HOME = Path.home()
+except (RuntimeError, KeyError):
+    # No home folder (bare container user). Importing must still work:
+    # diff and selfcheck do not need it, and a traceback would exit with 1.
+    HOME = None
 # Where Claude products keep installed skills and plugins. Checked at
 # runtime because no single session has all of them. Folders with a
 # "synced" child are expanded: each sync folder becomes its own root.
-AUTO_CANDIDATES = [
-    HOME / ".claude" / "plugins" / "synced",
-    HOME / ".claude" / "plugins" / "cache",
-    HOME / ".claude" / "skills",
+AUTO_CANDIDATES = ([HOME / ".claude" / "plugins" / "synced",
+                    HOME / ".claude" / "plugins" / "cache",
+                    HOME / ".claude" / "skills"] if HOME else []) + [
     Path("/mnt/skills/user"),
     Path("/mnt/skills/public"),
     Path("/mnt/skills/plugin-files"),
@@ -105,11 +133,49 @@ AUTO_SKIPPED = [Path("/mnt/skills/examples")]
 
 SELF_FILES = ("scripts/skillbouncer_scan.py", "scripts/skillbouncer_baseline.py", "SKILL.md")
 
+# plugin.json, manifest.json and the sidecars are a few KB. A scanned
+# package controls them, so reading stops well before memory matters.
+META_LIMIT = 4 * 1024 * 1024
+
+# Same frontmatter shape the scanner accepts, so both tools agree on the
+# name a skill declares.
+FRONTMATTER = re.compile(r"\A\ufeff?---\r?\n(.*?)\r?\n---\s*(\r?\n|$)", re.S)
+
+# A number or a timestamp and nothing else.
+MARKER_TEXT = re.compile(r"[0-9T:.Z+\-\s]*\Z")
+
+SPECIAL_KINDS = {stat.S_IFIFO: "fifo", stat.S_IFSOCK: "socket", stat.S_IFCHR: "chardev", stat.S_IFBLK: "blockdev"}
+
 
 def fail(msg):
     """Exit 2 with a message. Used wherever silence would look like a pass."""
-    print("error: " + msg, file=sys.stderr)
+    print("error: " + shown(msg, 2000), file=sys.stderr)
     sys.exit(2)
+
+
+def shown(value, limit=200):
+    """Text for one output line. Names, versions and paths come from the
+    packages under review; a line break in a plugin name would otherwise
+    let that plugin write its own lines into the summary the reviewer
+    reads."""
+    text = str(value)
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode("ascii") for ch in text)
+
+
+def to_bytes(text):
+    """File names and link targets are bytes that need not be UTF-8.
+    Python hands them over with surrogate escapes; this restores the
+    original bytes for hashing where a plain encode would raise."""
+    return text.encode("utf-8", "surrogateescape")
+
+
+def scalar(value):
+    """Metadata from foreign JSON is kept only as plain text or number. A
+    nested structure in a version field has no use and could be made deep
+    enough to break writing the snapshot."""
+    return value if isinstance(value, (str, int, float)) and not isinstance(value, bool) else None
 
 
 def tool_version():
@@ -134,64 +200,160 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def files_hash(files):
+    """One hash over all entries of a unit: lets a unit that moved or was
+    relabelled but is identical in content be recognised as unchanged."""
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
 def doc_id_for(unit_id):
     """Unit -> valid document ID (max. 200 characters, allowed characters)."""
     return DOC_ID_SAFE.sub("_", unit_id)[:200]
 
 
-def entry_hash(p):
-    """Hash of one directory entry, or None for anything that is neither a
-    file nor a symlink. Symlinks are not followed but hashed as an entry of
-    their own (the target as text), because a symlink that newly appears
-    is a warning sign in itself."""
-    if p.is_symlink():
-        return "symlink:" + hashlib.sha256(str(p.readlink()).encode()).hexdigest()
-    if p.is_file():
-        return sha256_file(p)
-    return None
+def entry_digest(path, kind):
+    """Hash of one directory entry. A symlink is hashed as an entry of its
+    own (the target as text) and never followed. Pipes, sockets and device
+    nodes cannot be hashed, but one that appears is a change, so its kind
+    stands in for the hash."""
+    try:
+        if kind == "link":
+            # Path() normalises the target ("./a" equals "a"), as earlier
+            # versions did; existing baselines stay comparable.
+            return "symlink:" + hashlib.sha256(to_bytes(str(Path(os.readlink(path))))).hexdigest()
+        if kind == "file":
+            return sha256_file(path)
+    except OSError as err:
+        fail("cannot read %s: %s; without it the snapshot would be incomplete" % (path, err))
+    return kind
 
 
-def iter_files(base, exclude=()):
-    """Yields (path, digest) for everything under base, hidden files
-    included, minus IGNORE_NAMES and the folders in exclude. Each
-    node_modules/<package>/ directory yields a single (directory, "dir:...")
-    pair instead of one pair per file."""
-    packages = {}
-    for p in sorted(base.rglob("*")):
-        parts = p.relative_to(base).parts
-        if any(part in IGNORE_NAMES for part in parts):
-            continue
-        if any(p == e or e in p.parents for e in exclude):
-            continue
-        digest = entry_hash(p)
-        if digest is None:
-            continue
+def walk(top, skip=frozenset()):
+    """Everything below top: (set of directories, list of (parts, kind))
+    with parts relative to top and kind "file", "link" or "special:<type>".
+    Symlinks are not followed. One pass per root, so that every later
+    step works on this list instead of searching the tree again per file
+    (that was quadratic). A stack instead of recursion, because a hostile
+    tree can be deeper than the recursion limit."""
+    dirs, entries = {top}, []
+    stack = [(top, ())]
+    while stack:
+        cur, parts = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                listing = list(it)
+            for e in listing:
+                here = parts + (e.name,)
+                if e.is_symlink():
+                    entries.append((here, "link"))
+                elif e.is_dir(follow_symlinks=False):
+                    if e.path not in skip:
+                        dirs.add(e.path)
+                        stack.append((e.path, here))
+                elif e.is_file(follow_symlinks=False):
+                    entries.append((here, "file"))
+                else:
+                    mode = stat.S_IFMT(e.stat(follow_symlinks=False).st_mode)
+                    entries.append((here, "special:" + SPECIAL_KINDS.get(mode, "other")))
+        except OSError as err:
+            fail("cannot list %s: %s; without it the snapshot would be incomplete" % (cur, err))
+    return dirs, entries
+
+
+def file_map(items):
+    """items: (parts relative to the unit, digest). Returns the unit's
+    file map. Each node_modules/<package>/ directory becomes a single
+    "dir:..." entry instead of one entry per file; its key gets a trailing
+    slash so it cannot be mistaken for a file of that name."""
+    files, packages = {}, {}
+    for parts, digest in items:
         if "node_modules" in parts[:-1]:
             i = parts.index("node_modules")
             # @scope/name packages sit one level deeper.
             depth = i + 3 if parts[i + 1].startswith("@") else i + 2
             if len(parts) > depth:
-                pkg = base.joinpath(*parts[:depth])
-                packages.setdefault(pkg, []).append("%s\0%s\n" % ("/".join(parts[depth:]), digest))
+                packages.setdefault(parts[:depth], []).append("%s\0%s\n" % ("/".join(parts[depth:]), digest))
                 continue
-        yield p, digest
-    for pkg, lines in sorted(packages.items()):
-        yield pkg, "dir:" + hashlib.sha256("".join(sorted(lines)).encode()).hexdigest()
+        files[os.sep.join(parts)] = digest
+    for pkg, lines in packages.items():
+        files[os.sep.join(pkg) + "/"] = "dir:" + hashlib.sha256(to_bytes("".join(sorted(lines)))).hexdigest()
+    return files
 
 
-def rel_key(path, base):
-    """Key of an entry in a unit's file map. Aggregated directories get a
-    trailing slash so they cannot be mistaken for a file of that name."""
-    rel = str(path.relative_to(base))
-    return rel + "/" if path.is_dir() and not path.is_symlink() else rel
-
-
-def read_json(path):
+def read_json(path, limit=None):
+    """A JSON object from path, or {} for anything else. RecursionError is
+    caught because a file of nothing but "[" is enough to raise it."""
     try:
-        data = json.loads(Path(path).read_text("utf-8"))
-    except (OSError, ValueError):
+        with open(path, "rb") as fh:
+            raw = fh.read() if limit is None else fh.read(limit + 1)
+        if limit is not None and len(raw) > limit:
+            return {}
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def read_meta(path):
+    """read_json for the small metadata files inside a scanned tree. Only
+    regular files: a link would be followed out of the tree and opening a
+    pipe would block for good."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        return {}
+    return read_json(path, META_LIMIT)
+
+
+def runtime_marker(path):
+    """True if the file holds what Claude's lock and round markers hold: at
+    most a few numbers or timestamps, bare or as a flat JSON object like
+    {"pid":105,"procStart":"145"}. These files change in every session, so
+    hashing them would raise a false alarm on every run. Checking the
+    content keeps the exception from becoming a hiding place: what passes
+    is too small and too plain to be code."""
+    try:
+        if os.path.getsize(path) > 256:
+            return False
+        with open(path, "rb") as fh:
+            text = fh.read(257).decode("ascii")
+    except (OSError, ValueError):
+        return False
+    if MARKER_TEXT.match(text):
+        return True
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(data, dict) and all(
+        re.match(r"[A-Za-z_]{1,32}\Z", k) and (type(v) in (int, float) or (isinstance(v, str) and MARKER_TEXT.match(v)))
+        for k, v in data.items())
+
+
+def sync_sidecar(root, name):
+    """True for manifest.json and <plugin folder>.meta.json directly in a
+    root: the sync writes them there and puts a new timestamp into them on
+    every round. Deeper down, or without the folder a sidecar belongs to,
+    a file of that name is not the sync's and gets hashed."""
+    folder = name[:-len(".meta.json")] if name.endswith(".meta.json") else ""
+    if name != "manifest.json" and not (folder and os.path.isdir(os.path.join(root, folder))):
+        return False
+    # Both are JSON objects; anything else under that name is not a sidecar.
+    return bool(read_meta(os.path.join(root, name)))
+
+
+def declared_names(path):
+    """The names a SKILL.md declares in its frontmatter. Claude registers a
+    skill under that name, which can differ from the folder name."""
+    try:
+        with open(path, "rb") as fh:
+            m = FRONTMATTER.match(fh.read(1024 * 1024).decode("utf-8", "replace"))
+    except OSError:
+        return []
+    found = []
+    for line in m.group(1).splitlines() if m else []:
+        km = re.match(r"^name\s*:\s*(.*)$", line)
+        if km and km.group(1).strip().strip("\"'"):
+            found.append(km.group(1).strip().strip("\"'"))
+    return found
 
 
 def load_manifest_info(root):
@@ -199,13 +361,17 @@ def load_manifest_info(root):
     places next to installed skills and plugins. That helps later to judge
     a change ("vendor update on 2026-11-03" versus "unexpected")."""
     info = {}
-    m = read_json(root / "manifest.json")
-    for s in m.get("skills", []) or []:
-        if isinstance(s, dict):
-            info["skill:" + str(s.get("name", ""))] = {"source": s.get("source"), "updatedAt": s.get("updatedAt")}
-    for p in m.get("plugins", []) or []:
-        if isinstance(p, dict):
-            info["plugin:" + str(p.get("name", ""))] = {"source": p.get("marketplaceName"), "version": p.get("version"), "updatedAt": p.get("updatedAt")}
+    m = read_meta(os.path.join(root, "manifest.json"))
+
+    def rows(key):
+        value = m.get(key)
+        return [r for r in value if isinstance(r, dict)] if isinstance(value, list) else []
+
+    for s in rows("skills"):
+        info["skill:" + str(s.get("name", ""))] = {"source": scalar(s.get("source")), "updatedAt": scalar(s.get("updatedAt"))}
+    for p in rows("plugins"):
+        info["plugin:" + str(p.get("name", ""))] = {"source": scalar(p.get("marketplaceName")), "version": scalar(p.get("version")),
+                                                    "updatedAt": scalar(p.get("updatedAt"))}
     return info
 
 
@@ -230,7 +396,9 @@ def discover_roots(extra):
             continue
         base_label = "%s-%s" % (cand.parent.name, cand.name) if cand.name in ("synced", "cache") else cand.name
         sync_parent = cand if cand.name == "synced" else cand / "synced"
-        sync_dirs = sorted(d for d in sync_parent.iterdir() if d.is_dir() and not d.is_symlink()) if sync_parent.is_dir() else []
+        # A sync folder that is a symlink is a root like any other. Left
+        # out, its plugins would be neither recorded nor missed.
+        sync_dirs = sorted(d for d in sync_parent.iterdir() if d.is_dir()) if sync_parent.is_dir() else []
         sync_label = base_label if cand.name == "synced" else base_label + "-synced"
         for n, d in enumerate(sync_dirs, 1):
             add(d, sync_label if n == 1 else "%s-%d" % (sync_label, n))
@@ -248,85 +416,165 @@ def discover_roots(extra):
 def snapshot(roots):
     """roots: list of (path, label, excluded folders)."""
     units = {}
+    seen_dirs, seen_files = set(), set()  # everything recorded, to judge where a symlink leads
+    links = []  # (link path, units holding it, label of its root, may be a unit folder)
 
     def store(uid, label, unit):
         # The same unit can be installed in several roots. Identical copies
         # count once; a differing copy gets the root label appended and is
         # tracked separately, because exactly that difference is suspicious.
-        if uid in units:
-            if units[uid]["files"] == unit["files"]:
-                return
-            uid = "%s@%s" % (uid, label)
-        unit["id"] = uid
-        units[uid] = unit
+        # Every further differing copy gets a number, so that none silently
+        # takes the place of another. Returns the unit that is kept.
+        taken, n = uid, 0
+        while taken in units:
+            if units[taken]["files"] == unit["files"]:
+                return units[taken]
+            n += 1
+            taken = "%s@%s" % (uid, label) if n == 1 else "%s@%s-%d" % (uid, label, n)
+        unit["id"] = taken
+        units[taken] = unit
+        return unit
+
+    def record(root, label, skip, link_name=None):
+        """Records one root. link_name is set when root is the target of a
+        symlinked unit folder: the unit is then named after the link, the
+        name under which it is installed."""
+        dirs, entries = walk(root, skip)
+        seen_dirs.update(dirs)
+        kinds = dict(entries)
+        meta = load_manifest_info(root)
+
+        def full(parts):
+            return os.path.join(root, *parts)
+
+        def folder_name(d):
+            return link_name if link_name and not d else os.path.basename(full(d))
+
+        # Plugins first, so that skills inside a plugin are not counted
+        # again as units of their own. Nothing inside node_modules is a
+        # unit; those folders are covered as packages.
+        plugin_dirs = sorted({p[:-2] for p in kinds if p[-2:] == (".claude-plugin", "plugin.json") and "node_modules" not in p})
+        unit_dirs = set(plugin_dirs)
+        skill_dirs = []
+        for p in sorted(p for p in kinds if p[-1] == "SKILL.md" and "node_modules" not in p):
+            d = p[:-1]
+            if kinds[p] != "file" and not (kinds[p] == "link" and os.path.isfile(full(p))):
+                continue
+            if any(d[:k] in unit_dirs for k in range(len(d) + 1)):
+                continue
+            unit_dirs.add(d)
+            skill_dirs.append(d)
+
+        held = {d: [] for d in unit_dirs}
+        loose, links_here, names = [], [], {}
+        for p, kind in entries:
+            path = full(p)
+            owners = [p[:k] for k in range(len(p)) if p[:k] in unit_dirs]
+            if kind == "file":
+                # Runtime markers only where Claude writes them: the lock
+                # files in <unit>/.in_use/ and a .last-complete-round at
+                # the top of a unit or root. Elsewhere the name means
+                # nothing and the file is hashed.
+                in_use = len(p) >= 2 and p[-2] == ".in_use" and p[:-2] in unit_dirs
+                round_marker = p[-1] == ".last-complete-round" and (len(p) == 1 or p[:-1] in unit_dirs)
+                if (in_use or round_marker) and runtime_marker(path):
+                    continue
+                if not owners and len(p) == 1 and sync_sidecar(root, p[0]):
+                    continue
+                # The empty marker next to a sync folder is named after
+                # it. Hashed under that name, a changed account ID would
+                # look like a changed unit.
+                if (not owners and p[-1].startswith(".bucket-") and os.path.join(os.path.dirname(path), p[-1][len(".bucket-"):]) in skip
+                        and os.path.getsize(path) == 0):
+                    continue
+                if p[-1] == "SKILL.md":
+                    names[p] = declared_names(path)
+            digest = entry_digest(path, kind)
+            seen_files.add(path)
+            if kind == "link":
+                links_here.append((path, p, owners))
+            for d in owners:
+                held[d].append((p[len(d):], digest))
+            if not owners:
+                loose.append((p, digest))
+
+        def names_below(d):
+            return sorted({n for p, found in names.items() if p[:len(d)] == d for n in found})
+
+        stored = {}
+        for d in plugin_dirs:
+            manifest = d + (".claude-plugin", "plugin.json")
+            pj = read_json(full(manifest), META_LIMIT) if kinds[manifest] == "file" else {}
+            name = str(pj.get("name") or folder_name(d))
+            uid = "plugin:" + name
+            sidecar = read_meta(os.path.join(os.path.dirname(full(d)), os.path.basename(full(d)) + ".meta.json"))
+            stored[d] = store(uid, label, {
+                "kind": "plugin", "name": name, "path": full(d),
+                "version": scalar(pj.get("version")) or meta.get(uid, {}).get("version"),
+                "source": scalar(sidecar.get("marketplace_name")) or meta.get(uid, {}).get("source"),
+                "updatedAt": meta.get(uid, {}).get("updatedAt"),
+                "files": file_map(held[d]), "skill_names": names_below(d), "uncovered_links": {},
+            })
+        for d in skill_dirs:
+            name = folder_name(d)
+            m = meta.get("skill:" + name, {})
+            stored[d] = store("skill:" + name, label, {
+                "kind": "skill", "name": name, "path": full(d),
+                "version": None, "source": m.get("source"), "updatedAt": m.get("updatedAt"),
+                "files": file_map(held[d]), "skill_names": names_below(d), "uncovered_links": {},
+            })
+        # Loose files (archives, foreign objects): whatever no unit holds.
+        if loose:
+            stored[None] = store("loose:" + label, label, {
+                "kind": "loose", "name": label, "path": root, "version": None, "source": None, "updatedAt": None,
+                "files": file_map(loose), "skill_names": [], "uncovered_links": {}})
+        for path, p, owners in links_here:
+            links.append((path, [stored[d] for d in owners or [None]], label,
+                          link_name is None and not owners and "node_modules" not in p))
+
+    def covered(real):
+        if real in seen_dirs or real in seen_files:
+            return True
+        # A link to nothing is no gap while the place it names lies in a
+        # recorded folder: whatever appears there later is hashed as a new
+        # file. Names the walk may skip are the exception.
+        parent, name = os.path.split(real)
+        skippable = (name in ("manifest.json", ".last-complete-round") or name.endswith(".meta.json")
+                     or name.startswith(".bucket-") or os.path.basename(parent) == ".in_use")
+        return not os.path.lexists(real) and parent in seen_dirs and not skippable
 
     for root_arg, label, exclude in roots:
-        root = Path(root_arg).resolve()
-        meta = load_manifest_info(root)
-        claimed = set()  # entries that already belong to a unit
+        record(str(Path(root_arg).resolve()), label, frozenset(str(e) for e in exclude))
 
-        def inside(p):
-            return not any(p == e or e in p.parents for e in exclude)
-
-        # 1) Plugins first, so that skills inside a plugin are not counted
-        #    again as units of their own.
-        plugin_roots = sorted({pj.parent.parent for pj in root.rglob(".claude-plugin/plugin.json")
-                               if inside(pj) and not any(part in IGNORE_NAMES or part == "node_modules" for part in pj.relative_to(root).parts)})
-        for pr in plugin_roots:
-            pj = read_json(pr / ".claude-plugin" / "plugin.json")
-            name = str(pj.get("name") or pr.name)
-            uid = "plugin:" + name
-            files = {}
-            for f, digest in iter_files(pr):
-                files[rel_key(f, pr)] = digest
-                claimed.add(f)
-            sidecar = read_json(pr.parent / (pr.name + ".meta.json"))
-            store(uid, label, {
-                "kind": "plugin", "name": name, "path": str(pr),
-                "version": pj.get("version") or meta.get(uid, {}).get("version"),
-                "source": sidecar.get("marketplace_name") or meta.get(uid, {}).get("source"),
-                "updatedAt": meta.get(uid, {}).get("updatedAt"),
-                "files": files,
-            })
-
-        # 2) Stand-alone skills
-        for sk in sorted(root.rglob("SKILL.md")):
-            sd = sk.parent
-            if not inside(sk) or not sk.is_file() or sk in claimed or any(sd == pr or pr in sd.parents for pr in plugin_roots):
-                continue
-            if any(part in IGNORE_NAMES or part == "node_modules" for part in sk.relative_to(root).parts):
-                continue
-            uid = "skill:" + sd.name
-            files = {}
-            for f, digest in iter_files(sd):
-                files[rel_key(f, sd)] = digest
-                claimed.add(f)
-            m = meta.get(uid, {})
-            store(uid, label, {
-                "kind": "skill", "name": sd.name, "path": str(sd),
-                "version": None, "source": m.get("source"), "updatedAt": m.get("updatedAt"),
-                "files": files,
-            })
-
-        # 3) Loose files (archives, manifests, foreign objects). manifest.json
-        #    and the .meta.json sidecars carry timestamps that change on
-        #    every sync.
-        loose = {}
-        for f, digest in iter_files(root, exclude):
-            if f in claimed or any(c in f.parents for c in claimed) or f.name == "manifest.json" or f.name.endswith(".meta.json"):
-                continue
-            loose[rel_key(f, root)] = digest
-        if loose:
-            store("loose:" + label, label, {"kind": "loose", "name": label, "path": str(root),
-                                             "version": None, "source": None, "updatedAt": None, "files": loose})
+    # A skill or plugin installed as a symlink to a folder elsewhere would
+    # otherwise be one link entry and nothing behind it ever compared. The
+    # target is read as a unit; links inside it are not followed further.
+    for path, _, label, unit_folder in sorted(links, key=lambda item: item[0]):
+        real = os.path.realpath(path)
+        if unit_folder and not covered(real) and os.path.isdir(real) and (
+                os.path.isfile(os.path.join(real, "SKILL.md")) or os.path.lexists(os.path.join(real, ".claude-plugin", "plugin.json"))):
+            record(real, label, frozenset(), os.path.basename(path))
+    for path, holders, _, _ in links:
+        if not covered(os.path.realpath(path)):
+            for unit in holders:
+                unit["uncovered_links"][path] = os.readlink(path)
 
     version = tool_version()
-    for u in units.values():
-        # Hash over all entries: lets a unit that moved but is identical in
-        # content be recognised as unchanged.
-        u["unit_hash"] = hashlib.sha256(json.dumps(u["files"], sort_keys=True).encode()).hexdigest()
+    doc_ids = set()
+    # Two IDs can map to one document ID ("a b" and "a_b", or long names
+    # with a common start). IDs that need no replacement go first and keep
+    # the plain form; a later one gets a piece of its own hash appended.
+    for uid in sorted(units, key=lambda i: (doc_id_for(i) != i, i)):
+        u = units[uid]
+        u["unit_hash"] = files_hash(u["files"])
         u["file_count"] = len(u["files"])
-        u["doc_id"] = doc_id_for(u["id"])
+        doc_id = doc_id_for(uid)
+        if doc_id in doc_ids:
+            doc_id = "%s~%s" % (doc_id[:187], hashlib.sha256(to_bytes(uid)).hexdigest()[:12])
+        if doc_id in doc_ids:
+            fail("no free document ID for unit %s" % uid)
+        doc_ids.add(doc_id)
+        u["doc_id"] = doc_id
         u["tool_version"] = version
     return {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "tool_version": version, "units": units}
 
@@ -341,37 +589,50 @@ def load_snapshot(path):
 def load_baseline_dir(d):
     """Reads baseline documents from a folder, subfolders included. Stores
     that wrap the document ({"data": {...}}) are unwrapped. Documents
-    without 'files' (e.g. configuration) are ignored."""
+    without 'files' (e.g. configuration) are ignored. If two documents
+    carry the same unit ID (the document ID of a unit can change when a
+    unit with a similar name comes or goes), the later review counts."""
     base = {}
     for p in sorted(Path(d).rglob("*.json")):
         doc = read_json(p)
         if isinstance(doc.get("data"), dict):
             doc = doc["data"]
-        if isinstance(doc.get("files"), dict) and "id" in doc:
+        if not isinstance(doc.get("files"), dict) or not isinstance(doc.get("id"), str):
+            continue
+        other = base.get(doc["id"])
+        if other is None or str(doc.get("reviewed_at") or "") >= str(other.get("reviewed_at") or ""):
             base[doc["id"]] = doc
     return base
 
 
 def diff(baseline, snap):
     cur = snap["units"]
-    by_hash = {u.get("unit_hash"): uid for uid, u in baseline.items()}
-    result = {"new": [], "removed": [], "changed": [], "unchanged": [], "to_review": []}
+    # Hashes are computed here, not taken from the documents: the files
+    # map is what was reviewed.
+    base_hash = {uid: files_hash(b["files"]) for uid, b in baseline.items()}
+    cur_hash = {uid: files_hash(u["files"]) for uid, u in cur.items()}
+    known, present = set(base_hash.values()), set(cur_hash.values())
+    result = {"new": [], "removed": [], "changed": [], "unchanged": [], "to_review": [], "uncovered_links": []}
 
     for uid, u in sorted(cur.items()):
         b = baseline.get(uid)
         if b is None:
-            if u["unit_hash"] in by_hash:
+            if cur_hash[uid] in known:
                 # Same content under another name/path: no new review.
                 result["unchanged"].append(uid)
                 continue
-            result["new"].append({"id": uid, "version": u.get("version"), "source": u.get("source"), "files": u["file_count"]})
+            result["new"].append({"id": uid, "version": u.get("version"), "source": u.get("source"), "files": len(u["files"])})
             result["to_review"] += [str(Path(u["path"]) / f) for f in u["files"]]
             continue
-        bf, cf = b.get("files", {}), u["files"]
+        bf, cf = b["files"], u["files"]
         added = sorted(set(cf) - set(bf))
         removed = sorted(set(bf) - set(cf))
         modified = sorted(f for f in set(cf) & set(bf) if cf[f] != bf[f])
-        if added or removed or modified:
+        # Two units that only traded IDs (root labels are positions in a
+        # sorted list of sync folders) are unchanged: each content is known
+        # and the content this ID had before is still installed.
+        swapped = cur_hash[uid] in known and base_hash[uid] in present
+        if (added or removed or modified) and not swapped:
             result["changed"].append({
                 "id": uid, "old_version": b.get("version"), "new_version": u.get("version"),
                 "source": u.get("source"), "added": added, "modified": modified, "removed": removed,
@@ -380,35 +641,63 @@ def diff(baseline, snap):
         else:
             result["unchanged"].append(uid)
 
-    current_hashes = {u["unit_hash"] for u in cur.values()}
     for uid in sorted(set(baseline) - set(cur)):
-        if baseline[uid].get("unit_hash") not in current_hashes:
+        if base_hash[uid] not in present:
             result["removed"].append(uid)
 
+    # Nothing compares what such a link points to, so it is reported on
+    # every run, whether the link itself changed or not.
+    listed = set(result["to_review"])
+    for uid, u in sorted(cur.items()):
+        for link, target in sorted((u.get("uncovered_links") or {}).items()):
+            result["uncovered_links"].append({"id": uid, "link": link, "target": target})
+            if link not in listed:
+                listed.add(link)
+                result["to_review"].append(link)
+
     # Units cleared under older rules were never looked at with the new
-    # ones; their hashes will not change on their own. A baseline document
-    # without tool_version predates 1.2.0 and counts as older.
+    # ones, and their hashes will not change on their own. Only unchanged
+    # units count: a new or changed unit is reviewed in this run anyway, and
+    # the document of a unit that is gone or waits for the user keeps its
+    # old version for good, which would ask for a rescan on every run. The
+    # version is looked up by content, so a unit that only moved is covered
+    # by the review of its content. A baseline document without
+    # tool_version predates 1.2.0 and counts as older.
     now = snap.get("tool_version")
-    old = sorted({str(b.get("tool_version") or "unknown") for b in baseline.values()} - {now})
+    reviewed_with = {}
+    for uid, b in baseline.items():
+        reviewed_with.setdefault(base_hash[uid], set()).add(str(b.get("tool_version") or "unknown"))
+    stale = [uid for uid in result["unchanged"] if now not in reviewed_with.get(cur_hash[uid], ())]
     result["tool_version"] = now
-    result["baseline_tool_versions"] = old
-    result["rescan_all"] = bool(old)
-    result["rescan_units"] = sorted(u["path"] for u in cur.values()) if old else []
+    result["baseline_tool_versions"] = sorted({v for uid in stale for v in reviewed_with.get(cur_hash[uid], ())})
+    result["rescan_all"] = bool(stale)
+    result["rescan_ids"] = sorted(stale)
+    result["rescan_units"] = sorted(cur[uid]["path"] for uid in stale)
+
+    # A unit left for the user to decide is not new work for this run, but
+    # it must not drop out of sight while it waits.
+    result["pending"] = sorted(uid for uid, b in baseline.items()
+                               if str(b.get("verdict") or "").upper() == "PENDING" and (uid in cur or base_hash[uid] in present))
     return result
 
 
 def skill_names(snap):
     """Names of all installed skills: stand-alone ones and those inside
-    plugins (the folder that holds a SKILL.md)."""
+    plugins, by folder (the one that holds a SKILL.md) and by the name the
+    SKILL.md declares. A new skill collides with an installed one if it
+    reuses either."""
     names = set()
     for u in snap["units"].values():
         if u.get("kind") == "skill":
-            names.add(u["name"].lower())
+            names.add(str(u.get("name", "")))
+        names.update(str(n) for n in u.get("skill_names") or [])
         for f in u.get("files", {}):
             parts = Path(f).parts
             if parts and parts[-1] == "SKILL.md" and len(parts) >= 2:
-                names.add(parts[-2].lower())
-    return sorted(names)
+                names.add(parts[-2])
+    # One name per line: a line break inside a folder name must not turn
+    # into a second name.
+    return sorted({shown(n.strip().lower(), 1000) for n in names} - {""})
 
 
 def parse_expectations(text):
@@ -417,6 +706,7 @@ def parse_expectations(text):
     by file name because the three checked names are distinct and the
     install folder differs between sessions."""
     want = {}
+    checked = {Path(rel).name for rel in SELF_FILES}
     for item in re.split(r"[,\n]", text):
         item = item.strip()
         if not item or item.startswith("#"):
@@ -424,7 +714,14 @@ def parse_expectations(text):
         m = re.match(r"^(?:sha256:)?([0-9a-fA-F]{64})(?::|\s+\*?)(.+)$", item)
         if not m:
             fail("cannot parse expected hash entry: %r" % item[:80])
-        want[Path(m.group(2).strip()).name] = m.group(1).lower()
+        name, digest = Path(m.group(2).strip()).name, m.group(1).lower()
+        # An entry that is never compared would still end in "passed", and
+        # the caller would take that file for verified.
+        if name not in checked:
+            fail("selfcheck cannot verify %s; it covers only %s" % (m.group(2).strip(), ", ".join(SELF_FILES)))
+        if want.get(name, digest) != digest:
+            fail("two different hashes given for %s" % name)
+        want[name] = digest
     return want
 
 
@@ -454,6 +751,12 @@ def selfcheck(want):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        # Paths with bytes that are not UTF-8 must not turn a message into
+        # a traceback.
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
     ap = argparse.ArgumentParser(description="Record and compare the reviewed state of installed skills and plugins")
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("snapshot", help="record the current state")
@@ -486,7 +789,7 @@ def main():
         if a.auto:
             roots, missing = discover_roots(a.root)
             for path, label, _ in roots:
-                print("root      %s  (%s)" % (path, label))
+                print("root      %s  (%s)" % (shown(path, 2000), shown(label)))
             for path in missing:
                 print("not here  %s" % path)
             for path in AUTO_SKIPPED:
@@ -504,31 +807,46 @@ def main():
                 # target: that can be a sync folder with a changing name.
                 roots.append((r, Path(r).name, ()))
         snap = snapshot(roots)
-        if not snap["units"]:
+        # Stray files alone are a "loose:" unit, but a snapshot without a
+        # single skill or plugin means the install locations were missed.
+        if not any(u["kind"] in ("plugin", "skill") for u in snap["units"].values()):
             fail("no skills or plugins found under %d root(s); refusing to write an empty snapshot" % len(roots))
         Path(a.out).write_text(json.dumps(snap, indent=1), "utf-8")
+        for uid, u in sorted(snap["units"].items()):
+            for link, target in sorted(u["uncovered_links"].items()):
+                print("uncovered %s -> %s  (%s; the target is not part of the snapshot)" % (
+                    shown(link, 2000), shown(target), shown(uid)))
         print("snapshot: %d units, %d entries, scanner %s -> %s" % (
-            len(snap["units"]), sum(u["file_count"] for u in snap["units"].values()), snap["tool_version"], a.out))
+            len(snap["units"]), sum(u["file_count"] for u in snap["units"].values()), snap["tool_version"], shown(a.out, 2000)))
 
     elif a.cmd == "export":
         snap = load_snapshot(a.snapshot)
+        # nargs="*" accepts "--only" with nothing after it. Read as "no
+        # filter" that would write a clean verdict for every unit.
+        if a.only is not None and not a.only:
+            fail("--only was given without a unit ID; nothing exported")
         unknown = sorted(set(a.only or []) - set(snap["units"]))
         if unknown:
             fail("--only names units that are not in the snapshot: %s" % ", ".join(unknown))
+        chosen = [(uid, u) for uid, u in snap["units"].items() if a.only is None or uid in a.only]
+        doc_ids = [str(u.get("doc_id", "")) for _, u in chosen]
+        # The document ID becomes a file name. Two units with one ID would
+        # overwrite each other while the count below still looked right.
+        if len(set(doc_ids)) != len(doc_ids) or any(not i or DOC_ID_SAFE.search(i) for i in doc_ids):
+            fail("snapshot holds missing, unsafe or duplicate document IDs; take a new snapshot")
         out = Path(a.out_dir)
         out.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        count = 0
-        for uid, u in snap["units"].items():
-            if a.only and uid not in a.only:
-                continue
+        for uid, u in chosen:
             doc = dict(u)
-            doc.pop("path", None)  # paths depend on the session and are not part of the baseline
+            # Paths depend on the session and are not part of the baseline;
+            # the other two are only needed for the snapshot at hand.
+            for key in ("path", "skill_names", "uncovered_links"):
+                doc.pop(key, None)
             doc.update({"reviewed_at": now, "reviewed_by": a.reviewed_by, "verdict": a.verdict,
                         "tool_version": snap.get("tool_version") or tool_version()})
             (out / (u["doc_id"] + ".json")).write_text(json.dumps(doc, indent=1), "utf-8")
-            count += 1
-        print("%d baseline documents written to %s" % (count, out))
+        print("%d baseline documents written to %s" % (len(chosen), shown(out, 2000)))
 
     elif a.cmd == "diff":
         if not Path(a.baseline_dir).is_dir():
@@ -543,24 +861,45 @@ def main():
         print("unchanged: %d | new: %d | changed: %d | removed: %d | entries to review: %d" % (
             len(r["unchanged"]), len(r["new"]), len(r["changed"]), len(r["removed"]), len(r["to_review"])))
         for item in r["new"]:
-            print("  NEW      %s (version %s, source %s, %d entries)" % (item["id"], item["version"], item["source"], item["files"]))
+            print("  NEW      %s (version %s, source %s, %d entries)" % (
+                shown(item["id"]), shown(item["version"]), shown(item["source"]), item["files"]))
         for item in r["changed"]:
-            print("  CHANGED  %s (%s -> %s): +%d ~%d -%d" % (item["id"], item["old_version"], item["new_version"], len(item["added"]), len(item["modified"]), len(item["removed"])))
+            print("  CHANGED  %s (%s -> %s): +%d ~%d -%d" % (
+                shown(item["id"]), shown(item["old_version"]), shown(item["new_version"]),
+                len(item["added"]), len(item["modified"]), len(item["removed"])))
         for uid in r["removed"]:
-            print("  REMOVED  %s" % uid)
+            print("  REMOVED  %s" % shown(uid))
+        for item in r["uncovered_links"]:
+            print("  LINK     %s: %s -> %s" % (shown(item["id"]), shown(item["link"], 2000), shown(item["target"])))
+        if r["removed"]:
+            print("removed: %d unit(s) of the baseline are missing; confirm each was uninstalled and that no install location "
+                  "is missing from the snapshot" % len(r["removed"]))
+        if r["uncovered_links"]:
+            print("links: %d symlink(s) lead to content the snapshot does not hold; review the targets or add their folder "
+                  "as a root" % len(r["uncovered_links"]))
+        for uid in r["pending"]:
+            print("  PENDING  %s" % shown(uid))
+        if r["pending"]:
+            print("pending: %d unit(s) still wait for the user's decision" % len(r["pending"]))
         if r["rescan_all"]:
-            print("scanner rules changed since baseline: full rescan recommended (baseline %s, now %s)" % (
-                ", ".join(r["baseline_tool_versions"]), r["tool_version"]))
-        # Exit code 1 signals "there is something to review".
-        sys.exit(1 if (r["new"] or r["changed"] or r["rescan_all"]) else 0)
+            print("scanner rules changed since baseline: rescan %d unchanged unit(s) (reviewed with %s, now %s)" % (
+                len(r["rescan_ids"]), shown(", ".join(r["baseline_tool_versions"])), shown(r["tool_version"])))
+        # Exit code 1 signals "there is something to review". Removed units
+        # count: a location the snapshot no longer covers looks the same as
+        # an uninstall, and only a person can tell which it is.
+        sys.exit(1 if (r["new"] or r["changed"] or r["removed"] or r["uncovered_links"] or r["rescan_all"]) else 0)
 
     elif a.cmd == "names":
         names = skill_names(load_snapshot(a.snapshot))
         Path(a.out).write_text("\n".join(names) + "\n", "utf-8")
-        print("%d skill names -> %s" % (len(names), a.out))
+        print("%d skill names -> %s" % (len(names), shown(a.out, 2000)))
 
     elif a.cmd == "selfcheck":
         if a.show:
+            # Printing compares nothing. Together with expectations it
+            # would end in exit 0 without having checked them.
+            if a.expect or a.expect_file:
+                fail("--print compares nothing; use it without --expect and --expect-file")
             skill_dir = Path(__file__).resolve().parent.parent
             for rel in SELF_FILES:
                 print("%s  %s" % (sha256_file(skill_dir / rel), rel))
@@ -569,7 +908,7 @@ def main():
         if a.expect_file:
             try:
                 text += "\n" + Path(a.expect_file).read_text("utf-8")
-            except OSError as err:
+            except (OSError, ValueError) as err:
                 fail("cannot read --expect-file: %s" % err)
         if not text.strip():
             fail("selfcheck needs --expect, --expect-file or --print")
@@ -579,4 +918,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as err:  # exit 1 means "changes to review" and must never come from a crash
+        fail("internal error, no result: %s: %s" % (type(err).__name__, err))

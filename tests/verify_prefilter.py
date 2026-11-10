@@ -9,10 +9,10 @@ spec = importlib.util.spec_from_file_location("scan", sys.argv[1]); scan = impor
 lost = 0; hits = 0; files = 0
 for base in sys.argv[2:]:
     for f in Path(base).rglob("*"):
-        if not f.is_file() or f.is_symlink() or ".git" in f.parts: continue
-        data = f.read_bytes()[: scan.MAX_TEXT_BYTES]
-        if b"\x00" in data[:8192]: continue
-        text = data.decode("utf-8", "replace"); low = text.lower(); files += 1
+        if not f.is_file() or f.is_symlink(): continue
+        # Decoded and folded exactly as scan_file does it; the proof is
+        # about that text, not about the raw bytes.
+        text = scan.read_text_file(f); low = scan.fold_for_prefilter(text); files += 1
         lines = text.splitlines()
         for rid, sev, desc, rx, code_only in scan.RULES:
             line_hit = any(rx.search(l) for l in lines)

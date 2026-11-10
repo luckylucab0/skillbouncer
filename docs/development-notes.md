@@ -14,7 +14,18 @@ Check a change against it before touching the rules.
   `tests/verify_prefilter.py` proves the prefilter loses no hit; run it after
   every rule change.
 - An unbounded `[^\n]*` inside a rule turns quadratic on minified lines of a
-  megabyte. Use `[^\n]{0,200}`.
+  megabyte. Use `[^\n]{0,200}`. The same holds for `\S*`, `\w*` and
+  `[^\]]*` after a prefix that can repeat inside the run: `curl ` twenty
+  thousand times on one line took 23 seconds, a few hundred KB of `http://`
+  more than a minute. Bound every one of them.
+- With `re.M` a leading `^\s*` is quadratic on blank lines: the anchor
+  matches at every line start and `\s*` runs across all blank lines that
+  follow. The prefilter narrows it to blanks within the line.
+- Line numbers come from an index built once per file (`LineIndex`).
+  `text.count("\n", 0, pos)` per finding is quadratic with many findings.
+  `visible_snippet` cuts before it loops, frontmatter lines are collected in
+  lists, and the package a file belongs to is found by walking up its
+  parents, not by comparing with every root.
 - `<!--(.*?)-->` is quadratic with many unclosed comments.
   `iter_html_comments` uses `str.find`. Do not reintroduce a regex there.
 - Three per-file checks are short-circuited because almost no file needs
@@ -27,7 +38,7 @@ Check a change against it before touching the rules.
 
 - Sleep thresholds differ by unit: Python and shell `sleep` count seconds
   (flag from 100), JavaScript `sleep()` and `setTimeout` count milliseconds
-  (flag from 1 000 000 and 10 000 000).
+  (flag from 100 000 and 1 000 000).
 - `"Login Data"` is matched case-sensitively with a path separator in front.
   Otherwise prose like "login data is stored" is HIGH.
 - `MAL-SKILL-TAMPER` is MEDIUM, not HIGH: legitimate installers touch
@@ -48,6 +59,23 @@ Check a change against it before touching the rules.
 - The frontmatter checks skip `allowed-tools` for the "reads like an
   instruction" test: `Bash(npm run *)` contains "run".
 
+- The prefilter text must be folded the way `re.IGNORECASE` compares, not
+  with `str.lower()` alone: dotless i, dotted capital I and long s match "i"
+  and "s" in the exact rule. Line separators are unified to `\n` first, or
+  the prefilter and the per-line pass disagree on where a line starts.
+- A pattern can be split over two lines (JSON between key and value, a
+  Markdown reference definition, wrapped prose). When the prefilter matches
+  and no single line does, pairs of adjacent lines are tried. On the corpus
+  this added no finding, so it costs nothing in noise.
+- Frontmatter is read per field including continuation lines. A value is
+  checked per line and capped in total, because an ordinary `metadata` map
+  is longer than 200 characters when joined. `compatibility` names products
+  ("Claude Code"), so there only text that addresses the model counts.
+- Two folders with the same name get their path appended to the label. The
+  script inventory and the package grouping are keyed by label; with the
+  bare folder name one entry overwrote the other, in an order that differed
+  between Python versions.
+
 ## Never fail open
 
 - Every per-file exception becomes a `SCAN-ERROR` HIGH finding. A file that
@@ -56,9 +84,62 @@ Check a change against it before touching the rules.
 - A target that yields nothing (missing path, broken archive, empty folder)
   is a HIGH finding, and usage errors exit with 2, the code of a HIGH
   finding. A gate that only looks at the exit code stays closed.
+- Nothing is skipped by name or extension. Files under `.git` are scanned.
+  A file with a media extension that is plain text is read as text
+  (`FS-DISGUISED-TEXT`).
+- The first bytes of a file prove nothing. `GIF89a=1` and `PK=1` are shell
+  assignments, and `sh logo.png` runs the readable lines of a file that
+  starts like a real PNG, because a shell drops NUL bytes and carries on
+  after a line it cannot run. Binary files therefore get the rules over
+  their readable text (runs of eight or more characters, NUL bytes removed),
+  one finding per rule and file. Runs shorter than eight are chance: the
+  font table tag `CFF ` followed by an `I` matched `cffi`.
+- The script part of an archive is measured from the archive structure
+  (offset of the first entry), not searched by signature. A `PK\x03\x04`
+  in a comment on line 1 cut the scanned part down to that one character.
+  It is still reported as `ARCHIVE-POLYGLOT`.
+- A pipe must never be opened: the scan blocks for good. This holds for the
+  small files the scanner parses itself (`plugin.json`, `SKILL.md`) as much
+  as for the files it scans.
+- Text is decoded before the rules run: a byte order mark is removed, UTF-16
+  is decoded, a few NUL bytes are dropped. A file that is mostly NUL under a
+  text or code extension is HIGH, because it was not read.
+- A file over the read limit is `FS-TRUNCATED` HIGH. `FS-LARGE` alone did
+  not say that content was left out.
+- `zipfile` raises more than `BadZipFile` (encrypted entry, unknown
+  compression method, corrupt stream, recursion). One bad entry is a finding
+  and the others are still extracted. Any other internal error ends in exit
+  code 2: a traceback exits with 1, which reads as "at most MEDIUM".
+- `Path.rglob` skips a folder it may not list without a word. The tree is
+  walked with `os.walk` and an error callback.
+- Output is written with `backslashreplace`. A lone surrogate from a JSON
+  escape or a file name cannot be encoded and ended the report in a
+  traceback.
 - The baseline script exits 2 wherever silence would read as "no changes":
-  a missing root, zero units, a missing baseline folder, a selfcheck without
-  expectations.
+  a missing root, no skill or plugin at all (stray files alone do not
+  count), a file or folder it cannot read, a missing baseline folder, a
+  selfcheck without expectations or with a hash it cannot check, `export
+  --only` without an ID. Any internal error exits 2 as well; exit code 1
+  is reserved for "changes to review".
+- `diff` exits 1 for removed units. A missing install location looks the
+  same as an uninstall, and only a person can tell which it is.
+- A skip list of names (`.git`, `__pycache__`, `.in_use`, `manifest.json`)
+  hid everything below such a name at any depth. The baseline hashes every
+  file. The few files Claude rewrites at runtime are left out only in the
+  one place where they belong and only while their content has the
+  expected shape (`runtime_marker`, `sync_sidecar`).
+- A symlink is an entry of its own and is never followed, which left a
+  skill installed as a symlink with nothing compared behind it. Such a
+  folder is recorded as a unit at its target; every other link to content
+  outside the snapshot is reported on each run (`uncovered_links`).
+- The rescan flag must come to an end. Built from every baseline document,
+  it stayed set for good once one unit was removed or left PENDING. It now
+  looks only at unchanged units and at the version their content was last
+  reviewed with.
+- Names, versions and paths from packages are printed on one line. A line
+  break in a plugin name wrote a forged line into the diff summary.
+- Looking up the owning unit per file was quadratic (4000 + 4000 files took
+  minutes). The tree is walked once per root.
 
 ## Environment
 

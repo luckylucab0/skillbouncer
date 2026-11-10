@@ -8,6 +8,9 @@ month for changes that arrived through updates. It consists of one skill (the
 review procedure Claude follows) and two Python scripts that need nothing but
 the standard library: a static pattern scanner and a hash baseline tool.
 
+The skill texts, the messages of the scripts and the rest of the
+documentation are English. Claude still answers in the user's language.
+
 ## What it does and does not do
 
 It does:
@@ -73,9 +76,6 @@ PENDING and waits for the user's decision. When the scanner version differs
 from the one recorded in the baseline, every unit is scanned again, because
 units cleared under older rules have never been seen by the new ones. The
 procedure is in `skills/skillbouncer/references/monthly-run.md`.
-
-Claude answers in the user's language in both modes. The skill text itself
-is English.
 
 ## Severity levels and exit codes
 
@@ -143,7 +143,13 @@ Options:
 Read the "Files scanned" count in the report header. A path that does not
 exist, a broken archive or an empty folder ends in a HIGH finding
 (`SCAN-TARGET`, `ARCHIVE-ERROR`, `SCAN-EMPTY`) and exit code 2, never in a
-clean report. Usage errors exit with 2 as well. Snippets in the report
+clean report. The same holds for content the scanner could not read in
+full: a file over 5 MB (`FS-TRUNCATED`), a binary under a text or code
+extension (`FS-UNKNOWN-BIN`), an archive entry that cannot be extracted, a
+folder that cannot be listed (`IO-ERROR`). Pictures, fonts and other binary
+files are searched for readable text, and the rules run over that text: a
+shell runs script lines inside a file whatever its first bytes say. Usage errors and internal errors
+exit with 2 as well. Snippets in the report
 are quotes from the scanned, untrusted content. When skillbouncer scans
 itself it reports its own search patterns and documentation as HIGH; that is
 expected.
@@ -152,11 +158,11 @@ The baseline script `skillbouncer_baseline.py` has five subcommands:
 
 | Subcommand | Purpose |
 |------------|---------|
-| `snapshot --auto [--root DIR ...] --out snap.json` | Find the install locations of this session and record a hash per file and unit. Explicit folders can be given instead of `--auto`. Exits 2 when a given folder does not exist or no unit is found. |
-| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Write one baseline document per unit into a folder as JSON. |
-| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Compare a snapshot with the baseline documents in a folder. Exits 1 when something needs review (new or changed units, or a changed scanner version), 0 otherwise. |
-| `names --snapshot snap.json --out names.txt` | Write the names of all installed skills, one per line, for `--known-names`. |
-| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Hash both scripts and SKILL.md and compare them with the expected hashes. Exits 2 on a mismatch or a missing hash. `--print` shows the current hashes. |
+| `snapshot --auto [--root DIR ...] --out snap.json` | Find the install locations of this session and record a hash per file and unit. Explicit folders can be given instead of `--auto`. Every file counts, `.git` and `__pycache__` included; a skill or plugin installed as a symlink is recorded at its target. Exits 2 when a given folder does not exist, no skill or plugin is found or something cannot be read. |
+| `export --snapshot snap.json --out-dir DIR [--only ID ...] [--verdict V]` | Write one baseline document per unit into a folder as JSON. `--only` without an ID is an error. |
+| `diff --baseline-dir DIR --snapshot snap.json --out diff.json` | Compare a snapshot with the baseline documents in a folder. Exits 1 when something needs review: new, changed or removed units, a symlink to content the snapshot does not hold, or unchanged units last reviewed under another scanner version. Exits 0 otherwise and 2 on an error. Units marked PENDING are listed without changing the exit code. |
+| `names --snapshot snap.json --out names.txt` | Write the names of all installed skills, one per line, for `--known-names`: folder names and the names the SKILL.md files declare. |
+| `selfcheck (--expect HASH:PATH[,HASH:PATH ...] \| --expect-file FILE \| --print)` | Hash both scripts and SKILL.md and compare them with the expected hashes. Exits 2 on a mismatch, a missing hash or a hash for any other file. `--print` shows the current hashes. |
 
 ## Setting up the monthly scheduled task
 
@@ -269,6 +275,8 @@ python3 -I tests/verify_prefilter.py skills/skillbouncer/scripts/skillbouncer_sc
 `tests/run_tests.py` builds both fixture sets into a temporary folder, runs
 the scanner and the baseline script on them and checks the results against
 the expected rule IDs per fixture.
+The run takes about half a minute; most of that are inputs that used to
+stall the scanner.
 `tests/verify_prefilter.py` proves that the scanner's fast whole-file
 prefilter loses no per-line hit; its last line must end in `lost 0`.
 `tests/profile_rules.py <scanner.py> <folder>` shows which rules cost the
@@ -288,8 +296,8 @@ generated and ignored by git.
 2. Add an inert fixture that triggers it to `tests/make_fixtures.py`, or to
    `tests/make_evasion_fixtures.py` when it models an evasion technique.
 3. Add the rule ID to the expected IDs of that fixture in
-   `tests/run_tests.py`, and check that the benign fixture (`benign-api`)
-   still has no MEDIUM or HIGH finding.
+   `tests/run_tests.py`, and check that the benign fixtures (`benign-api`,
+   `ev-benign`, `ev-benign-meta`) still have no MEDIUM or HIGH finding.
 4. Run the tests and `verify_prefilter.py`.
 
 Leave existing regexes as they are unless you mean to change a rule; they

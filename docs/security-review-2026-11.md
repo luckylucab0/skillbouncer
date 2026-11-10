@@ -2,9 +2,11 @@
 
 Version 1.2.0 exists because of this review. It looked at the tool the way an
 attacker would: what gets past the scanner, and what can be done to the
-review itself. Each finding below has a fixture in
+review itself. The scanner findings (R2 to R8) have a fixture in
 `tests/make_evasion_fixtures.py` (case numbers E1 to E12) and an expected
-detection in `tests/run_tests.py`, so a regression shows up as a failing test.
+detection in `tests/run_tests.py`. R1, R9 and R10 concern the baseline
+script and are tested with a small tree built in `test_baseline`. R11 is a
+set of rules in the procedure texts and has no test.
 
 ## Findings and how 1.2.0 closes them
 
@@ -28,6 +30,42 @@ it for minutes), and three more turned up while 1.2.0 was written: a path
 that does not exist, a file with an archive extension that is not a ZIP, and
 an empty folder each ended in an empty report with exit code 0. They now end
 in `SCAN-TARGET`, `ARCHIVE-ERROR` and `SCAN-EMPTY` (HIGH, exit code 2).
+
+## Second round: review of 1.2.0 before release
+
+The finished 1.2.0 code was reviewed once more by independent reviewers, and
+every reported finding was reproduced by a second one before it counted.
+All 44 held: 24 in the scanner, 12 in the baseline script, 8 in the
+documentation. Most scanner gaps were already in 1.1.1. They are closed in
+1.2.0; the scanner cases are fixtures E13 to E19 and the checks in
+`test_hardening`, the baseline cases are checks in `test_baseline`.
+
+The fixes were then checked by reviewers who had not written them. Six
+of them left a way around and were redone (S21).
+
+| # | Finding | Severity | Closed by |
+|---|---------|----------|-----------|
+| S1 | Files under a folder named `.git` were skipped without a trace. | critical | Scanned like any other file. |
+| S2 | A file with an image, font, PDF or media extension was never read as text: a shell script named `logo.png` gave an empty report. | critical | Skipped only when it starts with a media signature; otherwise `FS-DISGUISED-TEXT` and scanned as text. |
+| S3 | A script with a ZIP appended was extracted as an archive and never scanned itself. | high | `ARCHIVE-POLYGLOT` (HIGH); the part in front of the ZIP data is scanned as code. |
+| S4 | Content after the first 5 MB of a file was not scanned, with only a LOW note about size. | high | `FS-TRUNCATED` (HIGH). |
+| S5 | An encrypted or corrupt archive entry, deeply nested JSON or a lone surrogate ended the scan in a traceback with exit status 1, which reads as "at most MEDIUM". | high | Per-entry `ARCHIVE-ERROR`, the rest is scanned; output with `backslashreplace`; every internal error exits 2. |
+| S6 | Inputs of a few hundred KB stalled the scan for minutes: blank lines against rules anchored with `^\s*`, repeated `curl `, `http://`, `>` or `![` against unbounded quantifiers, and per-finding line counting. | high | Bounded quantifiers, a narrowed prefilter anchor, a line index. Timed in `test_hardening`. |
+| S7 | Unread content was MEDIUM or silent: a NUL byte in a script, a binary tail after 8 KB of text, a `.tgz` as target, an empty target next to a full one, a folder that cannot be listed. | medium | Text with stray NUL bytes is scanned, binaries under text or code extensions are HIGH, `SCAN-EMPTY` per target, `IO-ERROR` for folders. |
+| S8 | A byte order mark on line 1 switched off the rules anchored at the line start; UTF-16 files (the native encoding of `.reg`) skipped every content rule. | high | Text is decoded first (`FS-ENCODING` for UTF-16). |
+| S9 | The prefilter dropped text written with dotless i or long s, which the exact rules match. | medium | The prefilter folds these letters; the proof runs over both fixture sets. |
+| S10 | A pattern split over two lines was seen by the prefilter and lost in the per-line pass. | medium | Adjacent lines are tried as a pair when no single line matches. |
+| S11 | Frontmatter checks read one line per key: nested maps, block scalars, quoted or dotted keys and YAML spellings of `name` got past `FM-EXTRA-FIELD` and `FM-NAME-COLLISION`. A lone `SKILL.md` as target got no frontmatter check at all. | medium | Fields are read with their continuation lines; `name` is normalised; a lone `SKILL.md` is checked like a skill folder. |
+| S12 | `COMBO-PKG-*` was defeated by a `SKILL.md` or `plugin.json` dropped next to one half of a split stealer, and same-named skill folders overwrote each other in the inventory. | medium | A package is the outermost plugin or skill; labels of same-named folders carry their path. |
+| S13 | `FILENAME-INJECTION` never saw folder names; `MD-HIDDEN-COMMENT` was LOW without an imperative word and missed `[Comment]:` and `.markdown` files. | medium | Folder names are checked; the comment rule is MEDIUM at least. |
+| S14 | The baseline skipped `.git`, `__pycache__`, `.DS_Store` and `.in_use` at any depth, and `manifest.json` and `*.meta.json` anywhere: a payload under such a name never changed a hash. | critical | Every file is hashed. Claude's runtime files are left out only in their one place and only with the expected content. |
+| S15 | A skill or plugin installed as a symlink was one link entry; nothing behind it was compared. Symlinked sync folders were not roots. | high | Recorded as a unit at its target. Other links to content outside the snapshot are reported by `diff` on every run. |
+| S16 | A third copy of a unit name replaced the second one in the snapshot, and two unit IDs could share one document ID and overwrite each other at export. | high | Further copies get `<id>@<root>-2` and so on; document IDs are made distinct and `export` refuses duplicates. |
+| S17 | `diff` exited 0 when units of the baseline were gone, `snapshot` passed with stray files and no skill or plugin, `export --only` without an ID exported everything as CLEAN, and `selfcheck` passed with a hash for a file it never compared. | high | Each of these exits 1 or 2 now. |
+| S18 | Deeply nested JSON, file names that are not UTF-8 and wrong types in `manifest.json` ended the run in a traceback with exit code 1, which reads as "changes to review". A line break in a plugin name wrote a forged line into the summary. | medium | Hostile input is hashed and the run goes on; any internal error exits 2; names are printed on one line. |
+| S19 | `names` listed folder names only, so a skill registered under another `name` in its frontmatter was missing from `--known-names`. Finding the unit of each file was quadratic and took minutes on large installs. | medium | Declared names are listed; one walk per root. |
+| S20 | The procedure texts could not be followed in places: the rescan after a scanner update never came to an end once a unit was removed or left PENDING, step 8 of the install review could not be done for an archive and recorded other hashes than the installed package for a clone, a failed run had no value in the `runs` format, and the two procedure files disagreed on a missing plugin folder. | medium | `diff` looks only at unchanged units for the rescan and lists PENDING ones; SKILL.md and `monthly-run.md` name the extraction command, the `ACCEPTED` and `FAILED` values and one answer for the missing folder. |
+| S21 | Found when the fixes were checked: a media signature was taken as proof (`GIF89a=1` is a shell assignment, and a real PNG header followed by script lines runs with `sh`); one NUL byte in a file with a media extension, or many in a file without extension, still ended in "not scanned"; the script part of an archive was looked for by its first two bytes; a run of encoded line breaks and four older rules were still quadratic; a pipe named `plugin.json` blocked the scan. | high | Binary files get the rules over their readable text. The script part of an archive is measured from the archive structure. Bounded quantifiers, and decoded entities are checked per line. Pipes are never opened. Fixture E19. |
 
 ## What the review did not solve
 
