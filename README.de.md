@@ -53,7 +53,8 @@ Repositorys:
 ```bash
 zip -r skillbouncer-v1.2.0.plugin . \
     -x '.git/*' '.github/*' 'tests/*' 'docs/*' 'README.md' 'README.de.md' \
-       'CHANGELOG.md' 'CLAUDE.md' '.gitignore' '*__pycache__*' '*.plugin'
+       'CHANGELOG.md' 'CLAUDE.md' 'SECURITY.md' '.gitignore' '*__pycache__*' \
+       '*.plugin'
 ```
 
 Die Ausschlüsse halten Tests, Repository-Metadaten und Entwicklerdokumente
@@ -279,6 +280,9 @@ geänderte Abhängigkeit wird deshalb als ganzer Ordner gemeldet.
   Plugins findet. Code, den ein Plugin zur Laufzeit nachlädt, oder ein
   MCP-Server, den es aus einem Paket ohne feste Version startet, liegt
   ausserhalb des Referenzstands.
+
+Einen Weg am Scanner oder am Referenzstand vorbei gefunden? In der
+`SECURITY.md` steht, wie du ihn vertraulich meldest.
 
 ## Entwicklung
 
